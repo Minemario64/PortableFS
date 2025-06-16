@@ -1,0 +1,13 @@
+----------Data Format Key----------
+
+B = 1 allocated byte
+b = 1 allocated bit
+| = Section
+:[name] = The name of the section
+{} = Container
+;[name] = The name of the Container
+%% = How the section is interpreted (Number/x, String/", Hex/#)
+[] = Repeating Container (A Container structure that will be used multiple times)
+? = Work in Progress / Will be changed later
+~? = ? but with a name
+\\() = Sudo Container with size allocation

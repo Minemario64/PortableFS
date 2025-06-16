@@ -1,0 +1,44 @@
+----------Data Format----------
+
+{
+    |B|:Version %x%
+    |B|:Compression Algorithm %x%
+    |BBBBBBBBBBBBB|:Filesystem Name %"%
+};Header
+
+{
+    [
+        |B|:Drive ID %#%
+        |BBBBBBBBBBBBB|:Drive Name %"%
+        \BB\(
+            ?
+        ):Drive Attributes %x%
+    ];Drive Header
+};Drives
+
+{
+    [
+        |B|:Drive ID %#%
+        [
+            ~?:File Data
+        ]
+    ]
+};Data
+
+----------File Data----------
+
+Supports: Metadata, Data Streams
+
+  Layout
+----------
+    [Name][options and data]
+
+Name: Filename
+options and data:
+-----------------
+    File data: b[SPCS][data][SPCE]
+    Metadata: m[SPCS][data (in JSON)][SPCE]
+    Directory Data: f[SPCS][Number of bytes for directory][SPC][Directory data][SPCE]
+    Data Streams: ;[SPCS][stream data][SPCE]
+
+    File data cannot go with directory data
