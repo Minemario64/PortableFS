@@ -1,44 +1,52 @@
-----------Data Format----------
+----------Data Format V1----------
 
 {
-    |B|:Version %x%
-    |B|:Compression Algorithm %x%
+    |BBBB|:pfs0 file type check
+    |B|:Version %x% = 0x00
     |BBBBBBBBBBBBB|:Filesystem Name %"%
+    |bbbb|:Number of Drives
+    [
+        |bbbb|:Drive Char
+        |bbbb|:Drive ID
+    ]
 };Header
 
 {
+    |0bbbbbbbB|:Number of Directories
     [
-        |B|:Drive ID %#%
-        |BBBBBBBBBBBBB|:Drive Name %"%
-        \BB\(
-            ?
-        ):Drive Attributes %x%
-    ];Drive Header
-};Drives
+        |0bbbbbbbB|:Directory ID
+        |B|:Byte Length of Directory Name
+        [
+            |B|:Directory Name Char
+        ]
+        \B\(
+            |b|:Hidden Flag
+            |b|:SimLink Flag
+        )
+        |BB|:High Directory ID
+        |BB|:SimLink Directory ID
+    ]
+};Directories
+
+{
+    |BBB|:Number of Files
+    [
+        |B|:Byte Length of File Name
+        [
+            |B|:File name char
+        ]
+        \B\(
+            |b|:Read Only Flag
+            |b|:Hidden Flag
+        )
+        |BB|:High Directory ID
+        |BBBBBBBB|:File Data Offset
+        |BBBBBBBB|:File Data Length
+    ]
+};File Headers
 
 {
     [
-        |B|:Drive ID %#%
-        [
-            ~?:File Data
-        ]
+        |B|:File Data Byte
     ]
-};Data
-
-----------File Data----------
-
-Supports: Metadata, Data Streams
-
-  Layout
-----------
-    [Name][options and data]
-
-Name: Filename
-options and data:
------------------
-    File data: b[SPCS][data][SPCE]
-    Metadata: m[SPCS][data (in JSON)][SPCE]
-    Directory Data: f[SPCS][Number of bytes for directory][SPC][Directory data][SPCE]
-    Data Streams: ;[SPCS][stream data][SPCE]
-
-    File data cannot go with directory data
+};File Data

@@ -11,3 +11,4 @@ b = 1 allocated bit
 ? = Work in Progress / Will be changed later
 ~? = ? but with a name
 \\() = Sudo Container with size allocation
+0 or 1 in || = Always Set Bit

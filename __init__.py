@@ -1,653 +1,420 @@
-version = [1, 0, 0]
-VERSION = ".".join([str(num) for num in version])
-
 from pathlib import Path
-import atexit
-from typing import Literal
-import re
-import json
+from typing import BinaryIO, Any
+from copy import deepcopy
+from dataclasses import dataclass
+import re as rgx
 
-def defaultDictKeys(keys: dict, **dictionary) -> dict:
-    for key, default in keys.items():
-        try:
-            dictionary[key]
-        except KeyError:
-            dictionary[key] = default
+def readBits(stream: BinaryIO, numBits: int, mode: int = 0) -> int:
+    numBytes = (numBits + 7) // 8
+    data = stream.read(numBytes)
+    if len(data) != numBytes:
+        raise EOFError("Not enough data to read the specified number of bits")
+    if mode == 0:
+        value = int.from_bytes(data, byteorder="big")
+        return value >> (numBytes * 8 - numBits)
 
-    return dictionary
+    elif mode == 1:
+        value = int.from_bytes(data, byteorder="big")
+        return value & ((1 << numBits) - 1)
 
-def flatten(l : list) -> list:
-    newList : list = []
-    for item in l:
-        if not isinstance(item, list):
-            newList.append(item)
-        else:
-            for extraItem in flatten(item):
-                newList.append(extraItem)
-    return newList
+    else:
+        raise ValueError("Invalid mode.")
 
-def fixedBytesLength(bytesObj: bytes, length: int, fill: bytes = bytes(b'\x00')) -> bytes:
-    if len(bytesObj) < length:
-        return bytesObj + fill*(length - len(bytesObj))
-    elif len(bytesObj) == length:
-        return bytesObj
-    elif len(bytesObj) > length:
-        return bytes(bytearray(bytesObj)[0:length])
-
-class FilesystemFile:
-
-    def __init__(self, byteData: bytes | None, filedata: dict | None, metadata: dict | None, streamData: dict | None) -> None:
-        self.bytes = byteData
-        self.files = filedata
-        self.metadata = metadata
-        self.streamdata = streamData
+@dataclass
+class Drive:
+    name: str
+    id: int
 
     def __repr__(self) -> str:
-        return f'<Bytes: {self.bytes}, Files: {self.files}, Metadata: {self.metadata}, Stream Data: {self.streamdata}>'
+        return f"Drive(name='{self.name}', id={hex(self.id)})"
 
-class PortableFilesystem:
+@dataclass
+class FileAttrs:
+    readOnly: bool
+    hidden: bool
 
-#    def killIfClosed(func):
-#        def killCheck(instance, *args, **kwargs):
-#            if instance.__closed__ == True:
-#                instance = None
-#                del instance
-#                return None
-#
-#            return func(*args, **kwargs)
-#
-#        return killCheck
+@dataclass
+class DirAttrs:
+    hidden: bool
 
-    registry: dict = {}
+@dataclass
+class File:
+    name: str
+    attributes: FileAttrs
+    highDir: int
+    offset: int
+    size: int
 
-    def __init__(self, filepath: Path):
-        self.__closed__ = False
-        self.filepath = filepath
-        PortableFilesystem.registry[str(filepath.absolute())] = self
-        self.file = filepath.open("rb")
-        self.version = int(self.file.read(1).hex(), 16) + 1
-        self.compressionVer = int(self.file.read(1).hex(), 16)
-        self.name = str(self.file.read(13), "ascii")
-        self.file.seek(1, 1)
+@dataclass
+class Directory:
+    id: int
+    name: str
+    attributes: DirAttrs
+    highDir: int
 
-        def getDrives() -> tuple[dict[str:str], dict[str: int]]:
-            drives = {}
-            drivesAttributes = {}
-            while True:
-                driveID = self.file.read(1).hex()
-                driveName = str(self.file.read(13).strip(b"\x00"), "ascii")
-                driveAttributes = int(self.file.read(2).hex(), 16)
-                drives[driveName] = driveID
-                drivesAttributes[driveID] = driveAttributes
-                if self.file.read(2) == b"\x00\x00":
-                    break
-                else:
-                    self.file.seek(-2, 1)
-            return (drives, drivesAttributes)
+class PortableFSEncodingError(Exception):
+    def __init__(self, message: str) -> None:
+        super().__init__(f"PortableFS Encoding Error: {message}")
 
-        self.driveLookup, self.driveAttributesLookup = getDrives()
+class PortableFSPathError(Exception):
+    def __init__(self, message: str) -> None:
+        super().__init__(f"PortableFS Path Error: {message}")
 
-        def getFile(start: int | None = None, end: int | None = None) -> tuple[str, bytes]:
-            if start != None:
-                self.file.seek(start)
-            name = bytearray()
-            while True:
-                byte = self.file.read(1)
-                if end != None and byte == b'\x9D':
+class PortableFSFileNotFoundError(Exception):
+    def __init__(self, message: str) -> None:
+        super().__init__(f"PortableFS File Not Found Error: {message}")
+
+class PortableFS:
+    VERSION: int = 1
+    DRIVE_CHARS: list[str] = list("ABCDEFGHIJKLMNOP")
+
+    def __init__(self, fspath: Path) -> None:
+        self.fspath: Path = fspath
+        self.file: BinaryIO = fspath.open("r+b")
+        if self.file.read(4) != b"pfs0":
+            raise ValueError("Not a PortableFS file")
+
+        if self.file.read(1) != bytes([self.VERSION - 1]):
+            raise ValueError("Unsupported PortableFS version: Version 1 only")
+
+        self.name: str = self.file.read(13).decode("utf-8").rstrip("\x00")
+        self.numDrives: int = readBits(self.file, 4, 1)
+        self.drives: list[Drive] = []
+        for _ in range(self.numDrives):
+            drive_name = self.DRIVE_CHARS[readBits(self.file, 4, 0)]
+            self.file.seek(-1, 1)
+            drive_id = readBits(self.file, 4, 1)
+            self.drives.append(Drive(drive_name, drive_id))
+
+        self.numDirs: int = int.from_bytes(self.file.read(2), byteorder="big")
+        self.dirs: list[Directory] = []
+        for _ in range(self.numDirs):
+            dir_id = int.from_bytes(self.file.read(2), byteorder="big")
+            if dir_id <= 0x0F:
+                raise PortableFSEncodingError("Directory ID must be greater than 0x0F")
+
+            if dir_id >= 0x8000:
+                raise PortableFSEncodingError("Directory ID must be less than 0x8000")
+            dirname = self.file.read(int(self.file.read(1).hex(), 16)).decode("utf-8")
+            attributesInt = readBits(self.file, 2, 0)
+            attrs = (attributesInt >> 1, attributesInt & 1)
+            hightDir = int.from_bytes(self.file.read(2), byteorder="big")
+            self.dirs.append(Directory(dir_id, dirname, DirAttrs(bool(attrs[0])), hightDir))
+
+
+        self.numFiles: int = int.from_bytes(self.file.read(3), byteorder="big")
+        self.files: list[File] = []
+        for _ in range(self.numFiles):
+            filename = self.file.read(int(self.file.read(1).hex(), 16)).decode("utf-8")
+            attributesInt = readBits(self.file, 2, 0)
+            attributes = (attributesInt >> 1, attributesInt & 1)
+            highDir = int.from_bytes(self.file.read(2), byteorder="big")
+            offset = int.from_bytes(self.file.read(8), byteorder="big")
+            size = int.from_bytes(self.file.read(8), byteorder="big")
+            self.files.append(File(filename, FileAttrs(*[bool(attr) for attr in attributes]), highDir, offset, size))
+
+        self.__dataStart: int = self.file.tell()
+        self.__dataLen: int = self.fspath.stat().st_size - self.__dataStart
+
+        class DictStructPath(dict):
+            def traversalSet(self, path: str, value: Any, *, mode: int = 0) -> None:
+                parts: list[str] = [part for part in path.split("/") if part != ""]
+                strCode: str = f"self[{int(parts[0]) if mode == 1 else repr(parts[0])}]"
+                for part in parts[1:-1]:
+                    strCode += f"['{part}'][1]"
+
+                strCode += f"['{parts[-1]}'] = val"
+                exec(strCode, {"__builtins__": None, "self": self, "val": value})
+
+        struct: DictStructPath = DictStructPath({})
+        HighDirTable: dict[int, list[File | Directory]] = {}
+        dirPathTable: dict[int, str] = {}
+
+        for drive in self.drives:
+            struct[drive.id] = {}
+
+        for file in self.files:
+            if file.highDir <= 0x0F:
+                self.file.seek(self.__dataStart + file.offset)
+                struct[file.highDir][file.name] = (file, self.file.read(file.size))
+                continue
+
+            if not file.highDir in HighDirTable.keys():
+                HighDirTable[file.highDir] = [file]
+
+            else:
+                HighDirTable[file.highDir].append(file)
+
+
+        for directory in self.dirs:
+            if directory.highDir <= 0x0F:
+                struct[directory.highDir][directory.name] = (directory, {})
+                dirPathTable[directory.id] = f"{directory.highDir}/{directory.name}"
+                continue
+
+            if (not directory.highDir in HighDirTable.keys()) and directory.id in HighDirTable.keys():
+                struct.traversalSet(f"{dirPathTable[directory.highDir]}/{directory.name}", (directory, {}), mode=1)
+                dirPathTable[directory.id] = f"{dirPathTable[directory.highDir]}/{directory.name}"
+
+            if not directory.highDir in HighDirTable.keys():
+                HighDirTable[directory.highDir] = [directory]
+
+            else:
+                HighDirTable[directory.highDir].append(directory)
+
+        while len(HighDirTable) > 0:
+            popQueue: list[int] = []
+            for dirID, items in HighDirTable.items():
+                if isinstance(items, str):
                     continue
-                if not byte or byte == b'\x00' or (end != None and self.file.tell() == end):
-                    if not byte or (end != None and self.file.tell() == end):
-                        return None
-                    name = str(name, "ascii")
-                    break
-                name.append(int(byte.hex(), 16))
 
-            attrStart = self.file.tell()
-
-            def getFileAttributes() -> bytearray:
-                text = bytearray()
-                Escaped = False
-                while True:
-                    byte = self.file.read(1)
-                    if byte == b"\x00":
-                        if not Escaped:
-                            break
-
-                        else:
-                            Escaped = False
-
-                    elif byte == b'\x9D':
-                        Escaped = True
-
-                    elif Escaped:
-                        Escaped = False
-
-                    elif not byte or (end != None and self.file.tell() == end):
-                        break
-
-                    text.append(int(byte.hex(), 16))
-                return text
-
-            def parseFileAttributes(attributes: bytearray) -> dict:
-                attrEnd = self.file.tell()
-                parsedAttributes: dict[str: bytearray] = {}
-                InAttr = False
-                curAttr = ''
-                Escaped = False
-                isNum = False
-                num = 0
-                for idx, byte in enumerate([bytes([num]) for num in attributes]):
-                    if not isNum:
-                        if not InAttr:
-                            if b'\x62\x6D\x66\x3B'.__contains__(byte):
-                                if byte == b'\x66':
-                                    startIdx = idx
-                                    dirStart = attrStart + (idx + 1) + 1
-                                    isNum = True
-                                curAttr = str(byte, "ascii")
-
-                            elif byte == b'\xFF' and curAttr != '':
-                                InAttr = True
-                        else:
-                            if byte == b'\xAF':
-                                if not Escaped:
-                                    InAttr = False
-                                    continue
-                                else:
-                                    Escaped = False
-                            elif byte == b'\x9D':
-                                Escaped = True
-
-                            elif Escaped:
-                                try:
-                                    parsedAttributes[curAttr]
-                                except KeyError:
-                                    parsedAttributes[curAttr] = bytearray()
-                                parsedAttributes[curAttr].append(int(byte.hex(), 16))
-                                Escaped = False
-
-                            try:
-                                parsedAttributes[curAttr]
-                            except KeyError:
-                                parsedAttributes[curAttr] = bytearray()
-                            parsedAttributes[curAttr].append(int(byte.hex(), 16))
-                    else:
-                        if byte == b'\x9D':
-                            dirStart += idx - (startIdx + 1)
-                            isNum = False
+                if dirID in dirPathTable.keys():
+                    for item in items:
+                        if isinstance(item, File):
+                            self.file.seek(self.__dataStart + item.offset)
+                            struct.traversalSet(f"{dirPathTable[dirID]}/{item.name}", (item, self.file.read(item.size)), mode=1)
                             continue
 
-                        num += int(byte.hex(), 16)
+                        if isinstance(item, Directory):
+                            struct.traversalSet(f"{dirPathTable[dirID]}/{item.name}", (item, {}), mode=1)
+                            continue
 
-                if parsedAttributes.__contains__('b') and parsedAttributes.__contains__('f'):
-                    raise ValueError("PortableFilesystemError: a file cannot be both a normal file and a directory")
+                    popQueue.append(dirID)
 
-                if parsedAttributes.__contains__('b'): parsedAttributes['b'] = bytes(parsedAttributes["b"])
-                if parsedAttributes.__contains__('m'): parsedAttributes["m"] = json.loads(str(parsedAttributes["m"], 'ascii'))
+            for dirID in popQueue:
+                HighDirTable.pop(dirID)
 
-                if num != 0:
-                    self.file.seek(dirStart)
-                    parsedAttributes['f'] = {}
-                    while True:
-                        file = getFile(None, dirStart + num)
-                        if file == None:
-                            break
-                        parsedAttributes['f'][file[0]] = file[1]
-                    parsedAttributes['b'] = None
-                    parsedAttributes['f'] = {k:v for k,v in parsedAttributes['f'].items() if k != ''}
-                    self.file.seek(attrEnd)
+        for drive in self.drives:
+            struct[drive.name] = struct[drive.id]
+            struct.pop(drive.id)
 
-                return parsedAttributes
-
-            fileAttributes = defaultDictKeys({'b': None, "m": None, ';': None, 'f': None}, **parseFileAttributes(getFileAttributes()))
-            return (name, FilesystemFile(fileAttributes['b'], fileAttributes['f'], fileAttributes['m'], fileAttributes[';']))
-
-        self._fileSystemLookup = {drive: {} for drive in self.driveLookup.values()}
-
-        curDrive = list(self.driveLookup.values())[0]
-        while True:
-            file = getFile()
-            if file == None:
-                break
-            self._fileSystemLookup[curDrive][file[0]] = file[1]
-            red = self.file.read(1)
-            if red == b'\x00':
-                curDrive = list(self.driveLookup.values())[list(self.driveLookup.values()).index(curDrive) + 1]
-            else:
-                self.file.seek(-1, 1)
-
-        class FSFileIOError(Exception):
-
-            def __init__(self, message: str) -> None:
-                super().__init__(f'FilesystemFileIOError: {message}')
-
-        class FSFileIO:
-
-            def __init__(self, file: FilesystemFile, mode: str = 'r', encoding: Literal['ascii', 'utf-8', 'utf-16'] = 'ascii') -> None:
-                if not isinstance(file, FilesystemFile):
-                    raise FSFileIOError(f"File object is not a FilesystemFile object")
-
-                modePattern = re.compile(r"^[rbw]*$")
-                if not modePattern.match(mode):
-                    raise FSFileIOError(f"Mode '{mode}' is invalid")
-
-                encodings = ['ascii', 'utf-8', 'utf-16']
-                if not encodings.__contains__(encoding.lower()):
-                    raise FSFileIOError(f"Encoding '{encoding}' is invalid")
-
-                self._pos = 0
-                self._mode = mode
-                self._file = file
-                self._value = file.bytes
-                self._encoding = encoding
-
-            def close(self) -> None:
-                self.flush()
-                self = 0
-                del self
-
-            def readable(self) -> bool:
-                return self._mode.__contains__("r")
-
-            def writable(self) -> bool:
-                return self._mode.__contains__("w")
-
-            def write(self, data: str | bytes, flush: bool = False) -> None:
-                if not self.writable():
-                    raise FSFileIOError("Does not have permissions to write to this file")
-
-                if self._mode.__contains__('b') and not isinstance(data, bytes):
-                    raise ValueError('Cannot write to a file in bytes mode with a non-bytes object')
-
-                if (not self._mode.__contains__('b')) and not isinstance(data, str):
-                    raise ValueError("Cannot write to a file in text mode with a non-str object")
-
-                match self._mode.__contains__('b'):
-                    case True:
-                        self._value = data
-
-                    case False:
-                        self._value = bytes(data, self._encoding)
-
-                if flush: self.flush()
-
-            def flush(self) -> None:
-                self._file.bytes = self._value
-
-            def read(self, size: int | None = None) -> bytes | str | None:
-                if not self.readable():
-                    raise FSFileIOError("Does not have permission to read from this file")
-
-                if size == None:
-                    return self._file.bytes if self._mode.__contains__('b') else str(self._file.bytes, self._encoding)
-
-                try:
-                    return bytes(bytearray(self._file.bytes)[self._pos:self._pos + size]) if self._mode.__contains__('b') else str(bytes(bytearray(self._file.bytes)[self._pos:self._pos + size]), self._encoding)
-                except Exception:
-                    return None
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc_value, traceback):
-                self.close()
-
-        class FSPathError(Exception):
-
-            def __init__(self, message: str) -> None:
-                super().__init__(f"FilesystemPathError: {message}")
-
-        def changePathToID(path: str) -> str:
-                parts = path.split('/', 1)
-                if self.driveLookup.get(parts[0].removesuffix(':')) != None:
-                    parts[0] = self.driveLookup[parts[0].removesuffix(":")] + ':'
-                else:
-                    validDriveParts = flatten([[name, ID] for name, ID in self.driveLookup.items()])
-                    if not validDriveParts.__contains__(parts[0].removesuffix(":")):
-                        raise FSPathError(f"There is no drive or drive ID of '{parts[0].removesuffix(':')}'")
-                return '/'.join(parts)
-
-        def changePathToName(path: str) -> str:
-                parts = path.split('/', 1)
-                if list(self.driveLookup.values()).__contains__(parts[0].removesuffix(':')):
-                    parts[0] = list(self.driveLookup.keys())[list(self.driveLookup.values()).index(parts[0].removesuffix(':'))] + ':'
-                return '/'.join(parts)
+        self._struct = deepcopy(struct)
+        del struct
+        del HighDirTable
+        del dirPathTable
 
         class FSPath:
-            pwd = f'{list(self.driveLookup.keys())[0]}:/'
+            def __init__(self, *strPath) -> None:
+                self.path: str = "/".join(strPath)
+                self.name: str = [part for part in self.path.split("/") if part != ""][-1]
+                self.drive: str = self.path.split("/")[0].removesuffix(":")
+                self.suffix: str = "." + self.name.split(".")[-1] if "." in self.name else ""
+                self.stem: str = self.name[: -len(self.suffix)] if self.suffix else self.name
+                self.suffixes: list[str] = [f".{ext}" for ext in self.name.split(".")[1:]] if "." in self.name else []
 
-            def __init__(self, *pathArgs: str, absolute: bool = False) -> None:
-                absPattern = re.compile(r'^[a-zA-Z0123456789]*:/')
-                if absPattern.match('/'.join(pathArgs)):
-                    absolute = True
+            def __Obj(pself) -> File | Directory | Drive: # pyright: ignore[reportSelfClsParameterName]
+                if pself.is_drive():
+                    for drive in self.drives:
+                        if drive.name == pself.drive:
+                            return drive
 
-                if absolute:
-                    self.path = changePathToID('/'.join(pathArgs))
+                    raise PortableFSPathError("Drive does not exist")
 
-                else:
-                    self.path = changePathToID(FSPath.pwd + '/'.join(pathArgs))
+                checkStr: str = "struct"
+                parts: list[str] = [part for part in pself.path.split("/") if part != ""]
+                for i, part in enumerate(parts):
+                    if i == 0:
+                        checkStr += f"['{part.removesuffix(":")}']"
 
-                def parsePath(path: str):
-                    result = path.split("/")
-                    result[0] = result[0].removesuffix(':')
-                    if result[-1] == '':
-                        result = result[0:-1]
+                    elif i < len(parts) - 1:
+                        checkStr += f"['{part}'][1]"
+
+                    else:
+                        checkStr += f"['{part}'][0]"
+
+                print(checkStr)
+                try:
+                    result: File | Directory = eval(checkStr, {"__builtins__": None, "struct": self._struct})
                     return result
 
-                self._parsedPath = parsePath(self.path)
+                except KeyError:
+                    raise PortableFSFileNotFoundError(f"path '{pself.path}'")
 
-                self.driveName = changePathToName(self.path).split('/', 1)[0].removesuffix(':')
-                self.driveID = self.path.split('/', 1)[0].removesuffix(':')
+            def __StructData(pself) -> tuple[File | Directory, bytes | dict] | dict: # pyright: ignore[reportSelfClsParameterName]
+                if pself.is_drive():
+                    return self._struct[pself.drive]
 
-                self.name = self.path.split("/")[-1]
-                self.suffix = f'.{self.name.split('.')[-1]}'
-                self.suffixes = [f".{suffix}" for suffix in self.name.split('.')[1::]]
-                self.stem = self.name.split('.', 1)[0]
+                checkStr: str = "struct"
+                parts: list[str] = [part for part in pself.path.split("/") if part != ""]
+                for i, part in enumerate(parts):
+                    if i == 0:
+                        checkStr += f"['{part.removesuffix(":")}']"
 
-            @property
-            def parent(self):
-                return FSPath(self.path.removesuffix(f"/{self.name}"), absolute=True)
+                    elif i < len(parts) - 1:
+                        checkStr += f"['{part}'][1]"
 
-            @staticmethod
-            def cwd():
-                return FSPath()
+                    else:
+                        checkStr += f"['{part}']"
 
-            def exists(pself) -> bool:
-                checkStr = 'lookup'
-                for idx, pathPart in enumerate(pself._parsedPath):
-                    if idx >= 1 and len(pself._parsedPath) - 1 != idx:
-                        checkStr += f"['{pathPart}'].files"
-                    elif idx < 1 or len(pself._parsedPath) - 1 == idx:
-                        checkStr += f"['{pathPart}']"
-
+                print(checkStr)
                 try:
-                    eval(checkStr, {'__builtins__': None, 'lookup': self._fileSystemLookup})
+                    result: tuple[File, bytes] | tuple[Directory, dict] = eval(checkStr, {"__builtins__": None, "struct": self._struct})
+                    return result
+
+                except KeyError:
+                    raise PortableFSFileNotFoundError(f"path '{pself.path}'")
+
+            def exists(pself) -> bool: # pyright: ignore[reportSelfClsParameterName]
+                if pself.is_drive():
                     return True
+
+                checkStr: str = "struct"
+                parts: list[str] = [part for part in pself.path.split("/") if part != ""]
+                for i, part in enumerate(parts):
+                    if i == 0:
+                        checkStr += f"['{part.removesuffix(":")}']"
+
+                    elif i < len(parts) - 1:
+                        checkStr += f"['{part}'][1]"
+
+                    else:
+                        checkStr += f"['{part}'][0]"
+
+                print(checkStr)
+                try:
+                    eval(checkStr, {"__builtins__": None, "struct": self._struct})
+                    return True
+
                 except KeyError:
                     return False
 
-            def is_file(pself) -> bool:
-                checkStr = 'lookup'
-                for idx, pathPart in enumerate(pself._parsedPath):
-                    if idx >= 1 and len(pself._parsedPath) - 1 != idx:
-                        checkStr += f"['{pathPart}'].files"
-                    elif idx < 1 or len(pself._parsedPath) - 1 == idx:
-                        checkStr += f"['{pathPart}']"
-                checkStr += '.bytes != None'
+            def is_drive(pself) -> bool: # pyright: ignore[reportSelfClsParameterName]
+                drivePattern = rgx.compile(r"^[ABCDEFGHIJKLMNOP]:/?$")
+                return bool(drivePattern.match(pself.path))
+
+
+            def is_file(pself) -> bool: # pyright: ignore[reportSelfClsParameterName]
+                checkStr: str = "struct"
+                parts: list[str] = [part for part in pself.path.split("/") if part != ""]
+                for i, part in enumerate(parts):
+                    if i == 0:
+                        checkStr += f"['{part.removesuffix(":")}']"
+
+                    elif i < len(parts) - 1:
+                        checkStr += f"['{part}'][1]"
+
+                    else:
+                        checkStr += f"['{part}'][0]"
 
                 try:
-                    return eval(checkStr, {'__builtins__': None, 'lookup': self._fileSystemLookup})
-                except KeyError:
-                    return False
-
-            def is_dir(pself) -> bool:
-                checkStr = 'lookup'
-                for idx, pathPart in enumerate(pself._parsedPath):
-                    if idx >= 1 and len(pself._parsedPath) - 1 != idx:
-                        checkStr += f"['{pathPart}'].files"
-                    elif idx < 1 or len(pself._parsedPath) - 1 == idx:
-                        checkStr += f"['{pathPart}']"
-
-                try:
-                    obj = eval(checkStr, {'__builtins__': None, 'lookup': self._fileSystemLookup})
-                    if isinstance(obj, dict):
+                    result: File | Directory = eval(checkStr, {"__builtins__": None, "struct": self._struct})
+                    if isinstance(result, File):
                         return True
 
-                    return obj.files != None
+                    return False
+
                 except KeyError:
                     return False
 
-            def iterdir(pself):
+            def is_dir(pself) -> bool: # pyright: ignore[reportSelfClsParameterName]
+                if pself.is_drive():
+                    return True
+
+                checkStr: str = "struct"
+                parts: list[str] = [part for part in pself.path.split("/") if part != ""]
+                for i, part in enumerate(parts):
+                    if i == 0:
+                        checkStr += f"['{part.removesuffix(":")}']"
+
+                    elif i < len(parts) - 1:
+                        checkStr += f"['{part}'][1]"
+
+                    else:
+                        checkStr += f"['{part}'][0]"
+
+                try:
+                    result: File | Directory = eval(checkStr, {"__builtins__": None, "struct": self._struct})
+                    if isinstance(result, Directory):
+                        return True
+
+                    return False
+
+                except KeyError:
+                    return False
+
+            def iterdir(pself): # pyright: ignore[reportSelfClsParameterName]
                 if not pself.is_dir():
-                    raise FSPathError('Cannot iterate a file or a path that does not exist')
+                    raise PortableFSPathError("Cannot iterate the contents of a file, or a directory that does not exist.")
 
-                checkStr = 'lookup'
-                for idx, pathPart in enumerate(pself._parsedPath):
-                    if idx >= 1 and len(pself._parsedPath) - 1 != idx:
-                        checkStr += f"['{pathPart}'].files"
-                    elif idx < 1 or len(pself._parsedPath) - 1 == idx:
-                        checkStr += f"['{pathPart}']"
+                checkStr: str = "struct"
+                parts: list[str] = [part for part in pself.path.split("/") if part != ""]
+                for i, part in enumerate(parts):
+                    if i == 0:
+                        checkStr += f"['{part.removesuffix(":")}']"
 
-                obj = eval(checkStr, {'__builtins__': None, 'lookup': self._fileSystemLookup})
-                if isinstance(obj, FilesystemFile):
-                    obj = obj.files
+                    else:
+                        checkStr += f"['{part}'][1]"
 
-                for filename in obj.keys():
+                d: dict = eval(checkStr, {"__builtins__": None, "struct": self._struct})
+                for filename in d:
                     yield pself.joinpath(filename)
 
-            def joinpath(self, *pathArgs: str):
-                return FSPath(self.path + ("/" if not self.path.endswith('/') else '') + "/".join(pathArgs), absolute=True)
+            @property
+            def parent(pself): # pyright: ignore[reportSelfClsParameterName]
+                dirs: list[str] = [part for part in pself.path.split("/") if part != ""]
+                if len(dirs) == 1:
+                    raise PortableFSPathError("A Drive Root path has no parent")
 
-            def chcwd(self) -> None:
-                if (not self.exists()) or self.is_file():
-                    raise FSPathError('Cannot change current working directory to a file or a path that does not exist')
-                FSPath.pwd = self.path
+                path: str = "/".join(dirs[:-1])
+                if not "/" in path:
+                    path += "/"
 
-            def touch(pself) -> None:
-                checkStr = 'lookup'
-                for idx, pathPart in enumerate(pself._parsedPath):
-                    if idx >= 1 and len(pself._parsedPath) - 1 != idx:
-                        checkStr += f"['{pathPart}'].files"
-                    elif idx < 1 or len(pself._parsedPath) - 1 == idx:
-                        checkStr += f"['{pathPart}']"
-                checkStr += ' = File(bytes(), None, None, None)'
+                return FSPath(path)
 
-                exec(checkStr, {"__builtins__": {'bytes': bytes, 'None': None}, 'File': FilesystemFile, 'lookup': self._fileSystemLookup})
+            def joinpath(pself, *strPath): # pyright: ignore[reportSelfClsParameterName]
+                return FSPath(pself.path.removesuffix("/"), *strPath)
 
-            def mkdir(pself) -> None:
-                checkStr = 'lookup'
-                for idx, pathPart in enumerate(pself._parsedPath):
-                    if idx >= 1 and len(pself._parsedPath) - 1 != idx:
-                        checkStr += f"['{pathPart}'].files"
-                    elif idx < 1 or len(pself._parsedPath) - 1 == idx:
-                        checkStr += f"['{pathPart}']"
-                checkStr += ' = File(None, {}, None, None)'
+            def touch(pself) -> None: # pyright: ignore[reportSelfClsParameterName]
+                if not pself.parent.exists():
+                    raise PortableFSPathError("Cannot touch a file if its parent does not exist.")
 
-                exec(checkStr, {"__builtins__": {'bytes': bytes, 'None': None}, 'File': FilesystemFile, 'lookup': self._fileSystemLookup})
+                path = "/".join([pself.drive] + [part for i, part in enumerate(pself.path.split("/")) if i != 0])
 
-            def open(pself, mode: str = 'r', encoding: str = 'utf-8') -> FSFileIO:
-                checkStr = 'lookup'
-                for idx, pathPart in enumerate(pself._parsedPath):
-                    if idx >= 1 and len(pself._parsedPath) - 1 != idx:
-                        checkStr += f"['{pathPart}'].files"
-                    elif idx < 1 or len(pself._parsedPath) - 1 == idx:
-                        checkStr += f"['{pathPart}']"
-                return FSFileIO(eval(checkStr, {'__builtins__': None, 'lookup': self._fileSystemLookup}), mode, encoding)
+                # For some reason, python mangles 'self.__dataLen' wrong
+                self._struct.traversalSet(path, (File(pself.name, FileAttrs(False, False), pself.parent.__Obj().id, self._PortableFS__dataLen, 0), b"")) # pyright: ignore[reportAttributeAccessIssue]
 
-            def remove(pself) -> None:
+            def mkdir(pself) -> None: # pyright: ignore[reportSelfClsParameterName]
+                if not pself.parent.exists():
+                    raise PortableFSPathError("Cannot make a directory if its parent does not exist.")
+
+                path = "/".join([pself.drive] + [part for i, part in enumerate(pself.path.split("/")) if i != 0])
+
+                self._struct.traversalSet(path, (Directory(max([Dir.id for Dir in self.dirs]), pself.name, DirAttrs(False), pself.parent.__Obj().id), {})) # pyright: ignore[reportAttributeAccessIssue]
+
+            def unlink(pself) -> None: # pyright: ignore[reportSelfClsParameterName]
+                if pself.is_drive():
+                    raise PortableFSPathError("Cannot unlink a drive")
+
                 if not pself.exists():
-                    raise FSPathError("Cannot remove a file that doesn't exist")
+                    raise PortableFSPathError("Cannot unlink a file or directory that does not exist")
 
-                checkStr = 'lookup'
-                for idx, pathPart in enumerate(pself.parent._parsedPath):
-                    if idx >= 1 and len(pself._parsedPath) - 1 != idx:
-                        checkStr += f"['{pathPart}'].files"
-                    elif idx < 1 or len(pself._parsedPath) - 1 == idx:
-                        checkStr += f"['{pathPart}']"
-
-                obj = eval(checkStr, {'__builtins__': None, 'lookup': self._fileSystemLookup})
-                if isinstance(obj, dict):
-                    obj.pop(pself.name)
-
-                elif isinstance(obj, FilesystemFile):
-                    obj.files.pop(pself.name)
-
-            def rename(pself, newPath) -> None:
-                if not pself.exists():
-                    raise FSPathError("Cannot rename a file that doesn't exist")
-
-                if not isinstance(newPath, FSPath):
-                    raise FSPathError("newPath has to be a Filesystem Path object")
-
-                with pself.open('rb') as file:
-                    content = file.read()
-
-                pself.remove()
-                newPath.touch()
-                with newPath.open("wb") as file:
-                    file.write(content)
+                d: bytes | dict = pself.parent.__StructData()[1]
+                if isinstance(d, dict):
+                    d.pop(pself.name)
 
             def __str__(self) -> str:
-                return changePathToName(self.path)
+                return self.path
+
+            def __repr__(pself) -> str: # pyright: ignore[reportSelfClsParameterName]
+                return f"{self.name}: FSPath('{pself.path}')"
 
         self.Path = FSPath
 
-    def __repr__(self) -> str:
-        return f"< PortableFilesystem | Name: {self.name}, Filepath: {self.filepath} >"
+        def __repr__(self) -> str:
+            return f"PortableFS< name: '{self.name} path: '{self.fspath} >"
 
-    def __str__(self) -> str:
-        return self.name
-
-    def save(self, filepath: Path | None = None) -> None:
-
-        def splitInt(num: int) -> list[int]:
-            parts: list[int] = []
-            while num > 0xFF:
-                parts.append(0xFF)
-                num -= 0xFF
-            parts.append(num)
-            return parts
-
-        header = bytes([self.version - 1, self.compressionVer]) + fixedBytesLength(bytes(self.name, 'ascii'), 13)
-        drives = b''.join([bytes([int(driveID, 16)]) + fixedBytesLength(bytes(driveName, 'ascii'), 13) + self.driveAttributesLookup[driveID].to_bytes(2, byteorder='big') for driveName, driveID in self.driveLookup.items()])
-
-        def FileAttrsToBytes(obj: FilesystemFile) -> bytes:
-            result = bytes()
-            for attr, attrData in {attributeName:attribute for attributeName, attribute in (('bytes', obj.bytes), ('files', obj.files), ('metadata', obj.metadata), ('streamdata', obj.streamdata)) if attribute != None}.items():
-                if attr == 'bytes':
-                    result += bytes('b', 'ascii') + b'\xFF' + attrData + b'\xAF'
-
-                if attr == 'metadata':
-                    result += bytes("m", "ascii") + b'\xFF' + bytes(json.dumps(attrData), "ascii") + b'\xAF'
-
-                if attr == 'files':
-                    dirBytes = (b'\x00'.join((b'\x00'.join([bytes(name, 'ascii'), FileAttrsToBytes(saveData)]) for name, saveData in obj.files.items()))).replace(b'\x00', b'\x9D\x00')
-                    result += bytes('f', 'ascii') + b'\xFF' + bytes(splitInt(len(dirBytes))) + b'\x9D' + dirBytes + b'\xAF'
-
-            return result
-
-        def convertFileToBytes(filepath) -> bytes:
-            if not isinstance(filepath, self.Path):
-                raise TypeError("")
-            if not filepath.exists():
-                raise ValueError("")
-            checkStr = 'lookup'
-            for idx, pathPart in enumerate(filepath._parsedPath):
-                if idx >= 1 and len(filepath._parsedPath) - 1 != idx:
-                    checkStr += f"['{pathPart}'].files"
-                elif idx < 1 or len(filepath._parsedPath) - 1 == idx:
-                    checkStr += f"['{pathPart}']"
-
-            obj = eval(checkStr, {'__builtins__': None, 'lookup': self._fileSystemLookup})
-
-            if isinstance(obj, dict):
-                result = b'\x00'.join([convertFileToBytes(filepath.joinpath(filename)) for filename in obj.keys()])
-
-            elif isinstance(obj, FilesystemFile):
-                result = b'\x00'.join((bytes(filepath._parsedPath[-1], 'ascii'), FileAttrsToBytes(obj)))
-
-            return result
-
-        filedata = b'\x00\x00'.join((convertFileToBytes(self.Path(f'{drive}:/')) for drive in self.driveLookup.values()))
-        path = filepath if filepath != None else self.filepath
-        with path.open('wb') as file:
-            file.write(header + b'\x00' + drives + b'\x00\x00' + filedata)
-
-    def extract(self, fspath, folderpath: Path) -> None:
-        if not isinstance(fspath, self.Path):
-            raise ValueError(f"Cannot extract if the directory to extract from is type '{type(path)}'.")
-
-        if not fspath.is_dir():
-            raise ValueError("Cannot extract if the directory to extract from is a file or does not exist.")
-
-        if not folderpath.is_dir():
-            raise ValueError("Cannot extract if the path to extract to is a file or does not exist.")
-
-        for path in fspath.iterdir():
-            if path.is_file():
-                ospath = folderpath.joinpath(path.name)
-                ospath.touch()
-                with path.open("rb") as file:
-                    content = file.read()
-
-                with ospath.open("wb") as file:
-                    file.write(content)
-
-                continue
-
-            if path.is_dir():
-                ospath = folderpath.joinpath(path.name)
-                ospath.mkdir(exist_ok=True)
-                self.extract(path, ospath)
-
-    def copy(self, dirpath: Path, fsdir) -> None:
-        if not isinstance(fsdir, self.Path):
-            raise ValueError(f"Cannot copy if the directory to copy to is type '{type(path)}'.")
-
-        if not fsdir.is_dir():
-            raise ValueError("Cannot copy if the directory to copy to is a file or does not exist.")
-
-        if not dirpath.is_dir():
-            raise ValueError("Cannot copy if the path to copy from is a file or does not exist.")
-
-        for path in dirpath.iterdir():
-            if path.is_file():
-                fspath = fsdir.joinpath(path.name)
-                fspath.touch()
-                with path.open("rb") as file:
-                    content = file.read()
-
-                with fspath.open("wb") as file:
-                    file.write(content)
-
-                continue
-
-            if path.is_dir():
-                fspath = fsdir.joinpath(path.name)
-                fspath.mkdir()
-                self.copy(path, fspath)
-
-    @staticmethod
-    def new(filepath: Path, name: str, drives: list[str]):
-        root = bytes([0, 0]) + fixedBytesLength(bytes(name, 'ascii'), 13)
-        drivesHeader = b""
-        for i, drive in enumerate(drives):
-            drivesHeader += bytes([i]) + fixedBytesLength(bytes(drive, 'ascii'), 13) + b"\x00\x00"
-
-        header = b"\x00".join([root, drivesHeader])
-
-        if not filepath.exists():
-            filepath.touch()
-
-        with filepath.open("wb") as file:
-            file.write(header + (b"\x00"*2))
-
-        return PortableFilesystem(filepath)
-
-    @atexit.register
-    @staticmethod
-    def closeAll() -> None:
-        for instance in PortableFilesystem.registry.values():
-            instance.__closed__ = True
-            instance.file.close()
-            instance = None
-            del instance
-
-        PortableFilesystem.registry.clear()
 
 if __name__ == "__main__":
-    path = Path("new.pfs")
-    if not path.exists():
-        fs = PortableFilesystem.new(path, "Launcher", ["T", "L"])
+    pfs = PortableFS(Path("filesysMock2.bin"))
+    path = pfs.Path("A:/secrets/secrets.txt")
+    print(pfs._struct['A']['secrets'][1]['secrets.txt'])
+    print(path.exists())
+    print(path.is_file())
+    print(path.is_dir())
+    print(pfs.Path("A:/").is_dir())
+    pfs.Path("A:/hi/").mkdir()
+    pfs.Path("A:/hi/index.html").touch()
+    for path in pfs.Path("A:/").iterdir():
+        print(path)
 
-    else:
-        fs = PortableFilesystem(path)
-
-    fs.Path("test.txt").touch()
-    with fs.Path("test.txt").open('w') as file:
-        file.write("Hi, I am a secret file...\nOh No! You see me :(")
-
-    fs.copy(Path("C:\\Users\\Charl\\OneDrive\\Documents\\Code_Projects\\python\\Languages"), fs.Path('L:/'))
-
-    Path("tst/").mkdir()
-    fs.extract(fs.Path('L:/'), Path("tst/"))
+    print(*[path for path in pfs.Path("A:/hi/").iterdir()], sep="\n")
