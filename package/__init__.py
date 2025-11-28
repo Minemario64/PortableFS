@@ -12,9 +12,6 @@ from copy import deepcopy
 from rich.traceback import install ; install()
 from dataclasses import dataclass
 import re as rgx
-from math import ceil
-from tqdm import tqdm
-import sys
 
 def readBits(stream: BinaryIO, numBits: int, mode: int = 0) -> int:
     numBytes = (numBits + 7) // 8
@@ -116,6 +113,7 @@ class PortableFS:
 
             if dir_id >= 0x8000:
                 raise PortableFSEncodingError("Directory ID must be less than 0x8000")
+
             dirname = self.file.read(int(self.file.read(1).hex(), 16)).decode("utf-8")
             attributesInt = readBits(self.file, 2, 0)
             attrs = (attributesInt >> 1, attributesInt & 1)
@@ -158,35 +156,6 @@ class PortableFS:
 
                 return eval(strCode, {"__builtins__": None, "self": self})
 
-            def traversalGetType(self, type: type) -> list:
-                def getTypesRec(path: str) -> list:
-                    results: list = []
-                    struct = self.traversalGet(path)
-                    if isinstance(struct, tuple):
-                        d = struct[1]
-
-                    else:
-                        d = struct
-
-                    if not isinstance(d, dict):
-                        raise ValueError("Bad Path")
-
-                    for val in d.values():
-                        if isinstance(val[0], type):
-                            results.append(val[0])
-
-                        if isinstance(val[0], Directory):
-                            results.extend(getTypesRec("/".join([path, val[0].name])))
-
-                    return results
-
-                results: list = []
-                for name, item in self.items():
-                    idk = getTypesRec(name)
-                    results.extend(idk)
-
-                return results
-
         self.__strCls = DictStructPath
         def sortModeHighDir(obj: File | Directory):
             return obj.highDir
@@ -218,38 +187,11 @@ class PortableFS:
             if directory.highDir <= 0x0F:
                 struct[directory.highDir][directory.name] = (directory, {})
                 dirPathTable[directory.id] = f"{directory.highDir}/{directory.name}"
-                if directory.id in HighDirTable.keys():
-                    for item in HighDirTable[directory.id]:
-                        if isinstance(item, File):
-                            self.file.seek(self.__dataStart + item.offset)
-                            struct.traversalSet(f"{dirPathTable[directory.id]}/{item.name}", (item, self.file.read(item.size)), mode=1)
-                            continue
-
-                        if isinstance(item, Directory):
-                            struct.traversalSet(f"{dirPathTable[directory.id]}/{item.name}", (item, {}), mode=1)
-                            continue
-
-                    HighDirTable.pop(directory.id)
-
                 continue
 
-            if directory.highDir in dirPathTable.keys():
+            if (not directory.highDir in HighDirTable.keys()) and directory.id in HighDirTable.keys():
                 struct.traversalSet(f"{dirPathTable[directory.highDir]}/{directory.name}", (directory, {}), mode=1)
                 dirPathTable[directory.id] = f"{dirPathTable[directory.highDir]}/{directory.name}"
-                if directory.id in HighDirTable.keys():
-                    for item in HighDirTable[directory.id]:
-                        if isinstance(item, File):
-                            self.file.seek(self.__dataStart + item.offset)
-                            struct.traversalSet(f"{dirPathTable[directory.id]}/{item.name}", (item, self.file.read(item.size)), mode=1)
-                            continue
-
-                        if isinstance(item, Directory):
-                            struct.traversalSet(f"{dirPathTable[directory.id]}/{item.name}", (item, {}), mode=1)
-                            continue
-
-                    HighDirTable.pop(directory.id)
-
-                continue
 
             if not directory.highDir in HighDirTable.keys():
                 HighDirTable[directory.highDir] = [directory]
@@ -257,21 +199,7 @@ class PortableFS:
             else:
                 HighDirTable[directory.highDir].append(directory)
 
-        lastLen: int = 0
-        lenCount: int = 0
         while len(HighDirTable) > 0:
-            if len(HighDirTable) != lastLen:
-                lastLen = len(HighDirTable)
-                lenCount = 0
-
-            else:
-                lenCount += 1
-
-            if lenCount > 50:
-                print("\n" + str(list(HighDirTable.keys())))
-                print(list(set([[dir for dir in self.dirs if item.highDir == dir.id][0].highDir for waiting in HighDirTable.values() for item in waiting])))
-                raise PortableFSEncodingError("PassingCantPlace")
-
             popQueue: list[int] = []
             for dirID, items in HighDirTable.items():
                 if isinstance(items, str):
@@ -617,7 +545,7 @@ class PortableFS:
 
                 path = "/".join([pself.drive] + [part for i, part in enumerate(pself.path.split("/")) if i != 0])
 
-                self._struct.traversalSet(path, (Directory(max([Dir.id for Dir in self._struct.traversalGetType(Directory)] + [15]) + 1, pself.name, DirAttrs(False), pself.parent.__Obj().id), {})) # pyright: ignore[reportAttributeAccessIssue]
+                self._struct.traversalSet(path, (Directory(max([Dir.id for Dir in self.dirs] + [16]), pself.name, DirAttrs(False), pself.parent.__Obj().id), {})) # pyright: ignore[reportAttributeAccessIssue]
 
             def unlink(pself) -> None: # pyright: ignore[reportSelfClsParameterName]
                 if pself.is_drive():
@@ -698,7 +626,6 @@ class PortableFS:
             files, dirs, data = [], [], []
             for name, val in dirContents.items():
                 if isinstance(val[0], File):
-                    print(f"Saving file '{name}'")
                     file: File = val[0]
                     file.name = name
                     file.size = len(val[1])
@@ -731,7 +658,6 @@ class PortableFS:
         fileData: bytes = bytes()
         for drive in self.drives:
             data += bytes([(PortableFS.DRIVE_CHARS.index(drive.name) << 4) + drive.id])
-            print(f"Saving Files From drive '{drive.name}'")
             dfiles, ddirs, ddata = flattenStructRec(self._struct[drive.name])
             files.extend(dfiles)
             dirs.extend(ddirs)
@@ -748,7 +674,6 @@ class PortableFS:
             if directory.id.bit_length() > 15:
                 PortableFSEncodingError("Cannot save a pfs for spec v1 with a directory ID larger than 2^15")
 
-            print(f"Saving dir '{directory.name}'")
             data += directory.id.to_bytes(2, byteorder="big")
             data += len(directory.name).to_bytes(byteorder="big")
             data += bytes(directory.name, 'utf-8')
@@ -757,7 +682,6 @@ class PortableFS:
 
         data += len(files).to_bytes(3, byteorder="big")
         for file in files:
-            print(f"Saving filedata of file {file.name}")
             data += len(file.name).to_bytes(byteorder="big")
             data += bytes(file.name, "utf-8")
             data += bytes([(int(file.attributes.readOnly) << 7) | (int(file.attributes.hidden) << 6)])
@@ -765,23 +689,8 @@ class PortableFS:
             data += file.offset.to_bytes(8, byteorder="big")
             data += file.size.to_bytes(8, byteorder="big")
 
-        print(f"compiling data")
+        data += fileData
 
-        CHUNK_SIZE: int = 80000
-
-        if not len(fileData) > CHUNK_SIZE:
-            print(f"saving data")
-            data += fileData
-
-        else:
-            print(f"Saving data as chunks")
-            dataChunks: list[bytes] = [fileData[0 + (i * CHUNK_SIZE):CHUNK_SIZE + (i * CHUNK_SIZE)] for i in range(ceil(len(fileData) / CHUNK_SIZE))]
-            cachedLen: int = len(dataChunks)
-            print(f"Saving {cachedLen} chunks")
-            for chunk in tqdm(dataChunks, desc="Compiling chunks"):
-                data += chunk
-
-        print(f"Compiled Data")
         svpath = self.fspath if path is None else path
         if not svpath.exists():
             svpath.touch()
@@ -809,12 +718,7 @@ class PortableFS:
 
         import os
         if os.name == "nt":
-            if len(sys.argv) > 1:
-                tmpPath: Path = Path(f"C:/Users/{sys.argv[1]}/Appdata/Local/Temp/pfsntmplte")
-
-            else:
-                tmpPath: Path = Path.home().joinpath("Appdata/Local/Temp/pfsntmplte")
-
+            tmpPath: Path = Path.home().joinpath("Appdata/Local/Temp/pfsntmplte")
             if not tmpPath.exists():
                 tmpPath.touch()
 
@@ -824,3 +728,18 @@ class PortableFS:
             pfs: PortableFS = PortableFS(tmpPath)
             pfs.newfs = True
             return pfs
+
+
+if __name__ == "__main__":
+    print(VerData(), end="\n\n")
+    pfs = PortableFS(Path("filesysMock2.bin"))
+    path = pfs.Path("A:/secrets/secrets.txt")
+    print(path.exists())
+    print(path.is_file())
+    print(path.is_dir())
+    print(pfs.Path("A:/").is_dir())
+    with path.open("w") as file:
+        file.write("Yoo!! You found me!")
+
+    with path.open() as file:
+        print(file.read())
