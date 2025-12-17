@@ -1,4 +1,4 @@
-from __init__ import PortableFS
+from .__init__ import PortableFS
 from pathlib import Path
 
 def copyFileToPFS(pfs: PortableFS, realpath: Path, pfspath) -> None:
@@ -38,10 +38,12 @@ def copyDirToPFS(pfs: PortableFS, realpath: Path, pfspath) -> None:
 
     for path in realpath.iterdir():
         if path.is_file():
+            print(f"Copying File {path}")
             pth = pfspath.joinpath(path.name)
             copyFileToPFS(pfs, path, pth)
 
         if path.is_dir():
+            print(f"Copying Dir from {realpath}")
             pth = pfspath.joinpath(path.name)
             copyDirToPFS(pfs, path, pth)
 

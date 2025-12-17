@@ -21,10 +21,13 @@ def readBits(stream: BinaryIO, numBits: int, mode: int = 0) -> int:
     data = stream.read(numBytes)
     if len(data) != numBytes:
         raise EOFError(f"Not enough data to read the specified number of bits ({len(data) = }, {numBytes}, {data}, {stream.tell() - numBytes}, {stream.seek(0, 2)}, {stream.tell()})")
+
+    # Mode 0 is for reading bits from the left
     if mode == 0:
         value = int.from_bytes(data, byteorder="big")
         return value >> (numBytes * 8 - numBits)
 
+    # Mode 1 is for reading bits from the right
     elif mode == 1:
         value = int.from_bytes(data, byteorder="big")
         return value & ((1 << numBits) - 1)
@@ -790,9 +793,19 @@ class PortableFS:
             file.write(data)
 
     @staticmethod
-    def new(name: str):
+    def new(name: str, drives: list[str]):
         if len(name) > 13:
             raise ValueError("Name cannot be greater than 13 characters")
+
+        if len(drives) > 16:
+            raise ValueError("Can only have 16 drives")
+
+        for drive in drives:
+            if not drive in PortableFS.DRIVE_CHARS:
+                raise ValueError("Drives can only be named A-P")
+
+            if drives.count(drive) >= 2:
+                raise ValueError("Drive names must be unique")
 
         def fixedBytesLength(bytesObj: bytes, length: int, fill: bytes = b'\x00') -> bytes:
             if len(bytesObj) < length:
@@ -818,8 +831,12 @@ class PortableFS:
             if not tmpPath.exists():
                 tmpPath.touch()
 
+            driveData: bytes = bytes([len(drives)])
+            for i, drive in enumerate(drives):
+                driveData += bytes([(PortableFS.DRIVE_CHARS.index(drive) << 4) | i])
+
             with tmpPath.open("wb") as file:
-                file.write(bytes("pfs0", "utf-8") + bytes([0]) + fixedBytesLength(bytes(name, "utf-8"), 13) + bytes([1, 0, 0, 0, 0, 0, 0]))
+                file.write(bytes("pfs0", "utf-8") + bytes([0]) + fixedBytesLength(bytes(name, "utf-8"), 13) + driveData + bytes([0, 0, 0, 0, 0]))
 
             pfs: PortableFS = PortableFS(tmpPath)
             pfs.newfs = True
