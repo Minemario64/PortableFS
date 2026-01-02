@@ -1,4 +1,4 @@
-ver: list[str | int] = [1, 0, 0, "alpha"]
+ver: list[str | int] = [1, 0, 1, '']
 
 def Version(sep: str = "-") -> str:
     return sep.join([".".join([str(num) for num in ver[0:3]]), str(ver[3])])
@@ -14,7 +14,7 @@ from dataclasses import dataclass
 import re as rgx
 from math import ceil
 from tqdm import tqdm
-import sys
+from io import BytesIO
 
 def readBits(stream: BinaryIO, numBits: int, mode: int = 0) -> int:
     numBytes = (numBits + 7) // 8
@@ -673,7 +673,7 @@ class PortableFS:
 
         self.close()
 
-    def save(self, path: Path | None = None) -> None:
+    def save(self, path: Path | None = None, retIO: bool = False) -> None | BytesIO:
         def fixedBytesLength(bytesObj: bytes, length: int, fill: bytes = b'\x00') -> bytes:
             if len(bytesObj) < length:
                 return bytesObj + fill*(length - len(bytesObj))
@@ -768,12 +768,12 @@ class PortableFS:
             data += file.offset.to_bytes(8, byteorder="big")
             data += file.size.to_bytes(8, byteorder="big")
 
-        print(f"compiling data")
+        print(f"Compiling data")
 
         CHUNK_SIZE: int = 80000
 
         if not len(fileData) > CHUNK_SIZE:
-            print(f"saving data")
+            print(f"Saving data")
             data += fileData
 
         else:
@@ -785,12 +785,16 @@ class PortableFS:
                 data += chunk
 
         print(f"Compiled Data")
-        svpath = self.fspath if path is None else path
-        if not svpath.exists():
-            svpath.touch()
+        if retIO:
+            return BytesIO(data)
 
-        with svpath.open("wb") as file:
-            file.write(data)
+        else:
+            svpath = self.fspath if path is None else path
+            if not svpath.exists():
+                svpath.touch()
+
+            with svpath.open("wb") as file:
+                file.write(data)
 
     @staticmethod
     def new(name: str, drives: list[str]):
@@ -822,11 +826,7 @@ class PortableFS:
 
         import os
         if os.name == "nt":
-            if len(sys.argv) > 1:
-                tmpPath: Path = Path(f"C:/Users/{sys.argv[1]}/Appdata/Local/Temp/pfsntmplte")
-
-            else:
-                tmpPath: Path = Path.home().joinpath("Appdata/Local/Temp/pfsntmplte")
+            tmpPath: Path = Path.home().joinpath("Appdata/Local/Temp/pfsntmplte")
 
             if not tmpPath.exists():
                 tmpPath.touch()

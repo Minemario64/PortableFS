@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="pfs",
-    version="1.0.0",
+    version="1.0.1",
     description="A Python implementation of the PortableFS spec",
     packages=find_packages(),
     install_requires=[
