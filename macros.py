@@ -1,4 +1,4 @@
-from .__init__ import PortableFS
+from __init__ import PortableFS
 from pathlib import Path
 
 def copyFileToPFS(pfs: PortableFS, realpath: Path, pfspath) -> None:
@@ -23,7 +23,7 @@ def copyFileToPFS(pfs: PortableFS, realpath: Path, pfspath) -> None:
     with pfspath.open("wb") as dupfile:
         dupfile.write(content)
 
-def copyDirToPFS(pfs: PortableFS, realpath: Path, pfspath) -> None:
+def copyDirToPFS(pfs: PortableFS, realpath: Path, pfspath, excludedPaths: list[str] | None = None) -> None:
     if not isinstance(pfspath, pfs.Path):
         raise TypeError("pfspath must be a Path of the passed PortableFS")
 
@@ -37,6 +37,9 @@ def copyDirToPFS(pfs: PortableFS, realpath: Path, pfspath) -> None:
         pfspath.mkdir()
 
     for path in realpath.iterdir():
+        if excludedPaths and path.name in excludedPaths:
+            continue
+
         if path.is_file():
             print(f"Copying File {path}")
             pth = pfspath.joinpath(path.name)
@@ -45,7 +48,13 @@ def copyDirToPFS(pfs: PortableFS, realpath: Path, pfspath) -> None:
         if path.is_dir():
             print(f"Copying Dir from {realpath}")
             pth = pfspath.joinpath(path.name)
-            copyDirToPFS(pfs, path, pth)
+            if excludedPaths:
+                excludedSubPaths = [excl[len(path.name)+1:] for excl in excludedPaths if excl.startswith(path.name + "/")]
+
+            else:
+                excludedSubPaths = None
+
+            copyDirToPFS(pfs, path, pth, excludedSubPaths)
 
 def copyFileToRealFS(pfs: PortableFS, realpath: Path, pfspath) -> None:
     if not isinstance(pfspath, pfs.Path):

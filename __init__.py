@@ -1,10 +1,13 @@
-ver: list[str | int] = [1, 0, 1, '']
+ver: list[str | int] = [2, 0, 0]
 
 def Version(sep: str = "-") -> str:
+    if len(ver) < 4:
+        return sep.join([".".join([str(num) for num in ver[0:3]])])
+
     return sep.join([".".join([str(num) for num in ver[0:3]]), str(ver[3])])
 
 def VerData(sep: str = " - ") -> str:
-    return "\n".join([f"Python Interface Version: {Version(sep)}", f"Spec Version: {PortableFS.VERSION}"])
+    return "\n".join([f"Python Interface Version: {Version(sep)}", f"Spec Versions: {", ".join([str(version) for version in PortableFS._VERSIONS])}"])
 
 from pathlib import Path
 from typing import BinaryIO, Any, Literal, overload
@@ -15,6 +18,7 @@ import re as rgx
 from math import ceil
 from tqdm import tqdm
 from io import BytesIO
+import zstandard as zstd
 
 def readBits(stream: BinaryIO, numBits: int, mode: int = 0) -> int:
     numBytes = (numBits + 7) // 8
@@ -84,13 +88,20 @@ class PortableFSFileIOError(Exception):
         super().__init__(f"PortableFS FileIO Error: {message}")
 
 class PortableFS:
-    VERSION: int = 1
-    DRIVE_CHARS: list[str] = list("ABCDEFGHIJKLMNOP")
+    _VERSIONS: list[int] = [1,2]
+    _DRIVE_CHARS: list[str] = list("ABCDEFGHIJKLMNOP")
     autoSave: bool = False
+    chunkSize: int = 80000
 
-    def __init__(self, fspath: Path) -> None:
-        self.fspath: Path = fspath
-        self.file: BinaryIO = fspath.open("r+b")
+    def __init__(self, fspath: Path | BytesIO) -> None:
+        if isinstance(fspath, Path):
+            self.fspath: Path = fspath
+            self.file: BinaryIO = fspath.open("r+b")
+
+        elif isinstance(fspath, BytesIO):
+            self.fspath = None # type: ignore
+            self.file: BinaryIO = fspath
+
         self.newfs: bool = False
         self.__closed: bool = False
         if self.file.read(4) != b"pfs0":
@@ -98,14 +109,21 @@ class PortableFS:
 
         self.version: int = self.file.read(1)[0]
 
-        if self.version != self.VERSION - 1:
-            raise ValueError(f"Unsupported PortableFS version: Version {PortableFS.VERSION} only")
+        if not self.version + 1 in self._VERSIONS:
+            raise ValueError(f"Unsupported PortableFS version: Versions {", ".join([str(version) for version in PortableFS._VERSIONS])} only")
+
+        self.compression: bool = False
+        self.compressionLevel: int = 0
+        if self.version == 1:
+            self.compression = readBits(self.file, 1) == 1
+            self.file.seek(-1, 1)
+            self.compressionLevel = readBits(self.file, 7, 1)
 
         self.name: str = self.file.read(13).decode("utf-8").rstrip("\x00")
         self.numDrives: int = readBits(self.file, 4, 1)
         self.drives: list[Drive] = []
         for _ in range(self.numDrives):
-            drive_name = self.DRIVE_CHARS[readBits(self.file, 4, 0)]
+            drive_name = self._DRIVE_CHARS[readBits(self.file, 4, 0)]
             self.file.seek(-1, 1)
             drive_id = readBits(self.file, 4, 1)
             self.drives.append(Drive(drive_name, drive_id))
@@ -138,7 +156,17 @@ class PortableFS:
             self.files.append(File(filename, FileAttrs(*[bool(attr) for attr in attributes]), highDir, offset, size))
 
         self.__dataStart: int = self.file.tell()
-        self.__dataLen: int = self.fspath.stat().st_size - self.__dataStart
+
+        if isinstance(self.fspath, Path):
+            self.__dataLen: int = self.fspath.stat().st_size - self.__dataStart
+
+        elif self.fspath is None:
+            self.__dataLen: int = len(self.file.getbuffer()) - self.__dataStart # type: ignore
+
+        fileData: bytes = self.file.read(self.__dataLen)
+        if self.compression:
+            decompressor: zstd.ZstdDecompressor = zstd.ZstdDecompressor()
+            fileData: bytes = decompressor.decompress(self.file.read(self.__dataLen))
 
         class DictStructPath(dict):
             def traversalSet(self, path: str, value: Any, *, mode: int = 0) -> None:
@@ -206,8 +234,7 @@ class PortableFS:
 
         for file in self.files:
             if file.highDir <= 0x0F:
-                self.file.seek(self.__dataStart + file.offset)
-                struct[file.highDir][file.name] = (file, self.file.read(file.size))
+                struct[file.highDir][file.name] = (file, fileData[file.offset:file.offset + file.size])
                 continue
 
             if not file.highDir in HighDirTable.keys():
@@ -224,8 +251,7 @@ class PortableFS:
                 if directory.id in HighDirTable.keys():
                     for item in HighDirTable[directory.id]:
                         if isinstance(item, File):
-                            self.file.seek(self.__dataStart + item.offset)
-                            struct.traversalSet(f"{dirPathTable[directory.id]}/{item.name}", (item, self.file.read(item.size)), mode=1)
+                            struct.traversalSet(f"{dirPathTable[directory.id]}/{item.name}", (item, fileData[item.offset:item.offset + item.size]), mode=1)
                             continue
 
                         if isinstance(item, Directory):
@@ -242,8 +268,7 @@ class PortableFS:
                 if directory.id in HighDirTable.keys():
                     for item in HighDirTable[directory.id]:
                         if isinstance(item, File):
-                            self.file.seek(self.__dataStart + item.offset)
-                            struct.traversalSet(f"{dirPathTable[directory.id]}/{item.name}", (item, self.file.read(item.size)), mode=1)
+                            struct.traversalSet(f"{dirPathTable[directory.id]}/{item.name}", (item, fileData[item.offset:item.offset + item.size]), mode=1)
                             continue
 
                         if isinstance(item, Directory):
@@ -283,8 +308,7 @@ class PortableFS:
                 if dirID in dirPathTable.keys():
                     for item in items:
                         if isinstance(item, File):
-                            self.file.seek(self.__dataStart + item.offset)
-                            struct.traversalSet(f"{dirPathTable[dirID]}/{item.name}", (item, self.file.read(item.size)), mode=1)
+                            struct.traversalSet(f"{dirPathTable[dirID]}/{item.name}", (item, fileData[item.offset:item.offset + item.size]), mode=1)
                             continue
 
                         if isinstance(item, Directory):
@@ -330,6 +354,9 @@ class PortableFS:
                 fself.__closed: bool = False
                 if not isinstance(fself.__data, bytes):
                     raise PortableFSFileIOError("Invalid path")
+
+            def truncate(self) -> None:
+                self.__data = bytes()
 
             def __check_closed(self) -> None:
                 if self.__closed:
@@ -458,7 +485,7 @@ class PortableFS:
                 parts: list[str] = [part for part in pself.path.split("/") if part != ""]
                 for i, part in enumerate(parts):
                     if i == 0:
-                        checkStr += f"['{part.removesuffix(":")}']"
+                        checkStr += f"['{part.removesuffix(':')}']"
 
                     elif i < len(parts) - 1:
                         checkStr += f"['{part}'][1]"
@@ -481,7 +508,7 @@ class PortableFS:
                 parts: list[str] = [part for part in pself.path.split("/") if part != ""]
                 for i, part in enumerate(parts):
                     if i == 0:
-                        checkStr += f"['{part.removesuffix(":")}']"
+                        checkStr += f"['{part.removesuffix(':')}']"
 
                     elif i < len(parts) - 1:
                         checkStr += f"['{part}'][1]"
@@ -504,7 +531,7 @@ class PortableFS:
                 parts: list[str] = [part for part in pself.path.split("/") if part != ""]
                 for i, part in enumerate(parts):
                     if i == 0:
-                        checkStr += f"['{part.removesuffix(":")}']"
+                        checkStr += f"['{part.removesuffix(':')}']"
 
                     elif i < len(parts) - 1:
                         checkStr += f"['{part}'][1]"
@@ -529,7 +556,7 @@ class PortableFS:
                 parts: list[str] = [part for part in pself.path.split("/") if part != ""]
                 for i, part in enumerate(parts):
                     if i == 0:
-                        checkStr += f"['{part.removesuffix(":")}']"
+                        checkStr += f"['{part.removesuffix(':')}']"
 
                     elif i < len(parts) - 1:
                         checkStr += f"['{part}'][1]"
@@ -555,7 +582,7 @@ class PortableFS:
                 parts: list[str] = [part for part in pself.path.split("/") if part != ""]
                 for i, part in enumerate(parts):
                     if i == 0:
-                        checkStr += f"['{part.removesuffix(":")}']"
+                        checkStr += f"['{part.removesuffix(':')}']"
 
                     elif i < len(parts) - 1:
                         checkStr += f"['{part}'][1]"
@@ -581,7 +608,7 @@ class PortableFS:
                 parts: list[str] = [part for part in pself.path.split("/") if part != ""]
                 for i, part in enumerate(parts):
                     if i == 0:
-                        checkStr += f"['{part.removesuffix(":")}']"
+                        checkStr += f"['{part.removesuffix(':')}']"
 
                     else:
                         checkStr += f"['{part}'][1]"
@@ -668,12 +695,12 @@ class PortableFS:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        if not self.newfs:
-            self.save()
-
         self.close()
 
-    def save(self, path: Path | None = None, retIO: bool = False) -> None | BytesIO:
+    def save(self, path: Path | None = None, retIO: bool = False, compression: bool | int | None = None) -> None | BytesIO:
+        if (path is None and self.fspath is None) and (not retIO):
+            raise ValueError("Cannot save a PortableFS with no path specified when it was initialized from a BytesIO")
+
         def fixedBytesLength(bytesObj: bytes, length: int, fill: bytes = b'\x00') -> bytes:
             if len(bytesObj) < length:
                 return bytesObj + fill*(length - len(bytesObj))
@@ -697,7 +724,7 @@ class PortableFS:
 
             return result
 
-        def flattenStructRec(dirContents: dict[str, tuple[File, bytes] | tuple[Directory, dict]], *, recursing: bool = True) -> tuple[list[File], list[Directory], bytes | list[bytes]]:
+        def flattenStructRec(dirContents: dict[str, tuple[File, bytes] | tuple[Directory, dict]], *, recursing: bool = False) -> tuple[list[File], list[Directory], list[bytes]]:
             files, dirs, data = [], [], []
             for name, val in dirContents.items():
                 if isinstance(val[0], File):
@@ -713,32 +740,38 @@ class PortableFS:
                     folder: Directory = val[0]
                     folder.name = name
                     dirs.append(folder)
-                    recFiles, recDirs, recData = flattenStructRec(val[1], recursing=False) # pyright: ignore[reportArgumentType]
+                    recFiles, recDirs, recData = flattenStructRec(val[1], recursing=False) # type: ignore
                     files.extend(recFiles)
                     dirs.extend(recDirs)
                     data.extend(recData)
                     continue
 
-            for i, file in enumerate(files):
-                file.offset = indexOffset(data, i)
-
-            return files, dirs, b"".join(data) if recursing else data
+            # Remove the offset setting here
+            return files, dirs, data
 
         if len(self.name) > 13:
             raise PortableFSEncodingError("Cannot save a pfs for spec v1 with a name of greater that 13 chars.")
 
         data: bytes = b"pfs0"
-        data += bytes([self.version]) + fixedBytesLength(self.name.encode(), 13) + bytes([len(self.drives)])
+        compressing: bool = compression if isinstance(compression, bool) else True if isinstance(compression, int) else self.compression
+        compressionLevel: int = 0 if not compressing else compression if isinstance(compression, int) else 10 if isinstance(compression, bool) else self.compressionLevel
+        data += bytes([self.version if not compressing else 1]) + bytes([(int(compressing) << 7) | compressionLevel]) + fixedBytesLength(self.name.encode(), 13) + bytes([len(self.drives)])
         files: list[File] = []
         dirs: list[Directory] = []
-        fileData: bytes = bytes()
+        data_list: list[bytes] = []
         for drive in self.drives:
-            data += bytes([(PortableFS.DRIVE_CHARS.index(drive.name) << 4) + drive.id])
+            data += bytes([(PortableFS._DRIVE_CHARS.index(drive.name) << 4) + drive.id])
             print(f"Saving Files From drive '{drive.name}'")
-            dfiles, ddirs, ddata = flattenStructRec(self._struct[drive.name])
+            dfiles, ddirs, ddata = flattenStructRec(self._struct[drive.name], recursing=False)
             files.extend(dfiles)
             dirs.extend(ddirs)
-            fileData += ddata # pyright: ignore[reportOperatorIssue]
+            data_list.extend(ddata)
+
+        # Set offsets globally
+        for i, file in enumerate(files):
+            file.offset = indexOffset(data_list, i)
+
+        fileData = b"".join(data_list)
 
         if len(dirs).bit_length() > 15:
             PortableFSEncodingError("Cannot save a pfs for spec v1 with the total amount of directories larger than 2^15")
@@ -770,15 +803,17 @@ class PortableFS:
 
         print(f"Compiling data")
 
-        CHUNK_SIZE: int = 80000
+        if compressing:
+            compressor = zstd.ZstdCompressor(level=compressionLevel)
+            fileData = compressor.compress(fileData)
 
-        if not len(fileData) > CHUNK_SIZE:
+        if not len(fileData) > PortableFS.chunkSize:
             print(f"Saving data")
             data += fileData
 
         else:
             print(f"Saving data as chunks")
-            dataChunks: list[bytes] = [fileData[0 + (i * CHUNK_SIZE):CHUNK_SIZE + (i * CHUNK_SIZE)] for i in range(ceil(len(fileData) / CHUNK_SIZE))]
+            dataChunks: list[bytes] = [fileData[0 + (i * PortableFS.chunkSize):PortableFS.chunkSize + (i * PortableFS.chunkSize)] for i in range(ceil(len(fileData) / PortableFS.chunkSize))]
             cachedLen: int = len(dataChunks)
             print(f"Saving {cachedLen} chunks")
             for chunk in tqdm(dataChunks, desc="Compiling chunks"):
@@ -805,7 +840,7 @@ class PortableFS:
             raise ValueError("Can only have 16 drives")
 
         for drive in drives:
-            if not drive in PortableFS.DRIVE_CHARS:
+            if not drive in PortableFS._DRIVE_CHARS:
                 raise ValueError("Drives can only be named A-P")
 
             if drives.count(drive) >= 2:
@@ -833,10 +868,10 @@ class PortableFS:
 
             driveData: bytes = bytes([len(drives)])
             for i, drive in enumerate(drives):
-                driveData += bytes([(PortableFS.DRIVE_CHARS.index(drive) << 4) | i])
+                driveData += bytes([(PortableFS._DRIVE_CHARS.index(drive) << 4) | i])
 
             with tmpPath.open("wb") as file:
-                file.write(bytes("pfs0", "utf-8") + bytes([0]) + fixedBytesLength(bytes(name, "utf-8"), 13) + driveData + bytes([0, 0, 0, 0, 0]))
+                file.write(bytes("pfs0", "utf-8") + bytes([1,0]) + fixedBytesLength(bytes(name, "utf-8"), 13) + driveData + bytes([0, 0, 0, 0, 0]))
 
             pfs: PortableFS = PortableFS(tmpPath)
             pfs.newfs = True

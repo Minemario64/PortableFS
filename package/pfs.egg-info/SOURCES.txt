@@ -1,8 +1,0 @@
-setup.py
-pfs/__init__.py
-pfs/macros.py
-pfs.egg-info/PKG-INFO
-pfs.egg-info/SOURCES.txt
-pfs.egg-info/dependency_links.txt
-pfs.egg-info/requires.txt
-pfs.egg-info/top_level.txt

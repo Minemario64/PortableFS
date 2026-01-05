@@ -4,6 +4,7 @@ B = 1 allocated byte
 b = 1 allocated bit
 | = Section
 :[name] = The name of the section
+/\ = What each mode / number of the section represents (0x00:[Representation],0x01:[Representation], etc.)
 {} = Container
 ;[name] = The name of the Container
 %% = How the section is interpreted (Number/x, String/", Hex/#)

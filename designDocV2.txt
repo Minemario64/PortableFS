@@ -1,0 +1,56 @@
+----------Data Specification V2----------
+
+{
+    |BBBB|:pfs0 file type check
+    |B|:Version %x% = 0x01
+    \B\(
+        |b|:Compression Type /0x00:None,0x01:zstd\
+        |bbbbbbb|:Compression Level if Compression Type is zstd
+    )
+    |BBBBBBBBBBBBB|:Filesystem Name %"%
+    |bbbb|:Number of Drives
+    [
+        |bbbb|:Drive Char
+        |bbbb|:Drive ID
+    ]
+};Header
+
+{
+    |0bbbbbbbB|:Number of Directories
+    [
+        |0bbbbbbbB|:Directory ID
+        |B|:Byte Length of Directory Name
+        [
+            |B|:Directory Name Char
+        ]
+        \B\(
+            |b|:Hidden Flag
+            |b|:SimLink Flag
+        )
+        |BB|:High Directory ID
+        |BB|:SimLink Directory ID *Can skip if SimLink Flag not set*
+    ]
+};Directories
+
+{
+    |BBB|:Number of Files
+    [
+        |B|:Byte Length of File Name
+        [
+            |B|:File name char
+        ]
+        \B\(
+            |b|:Read Only Flag
+            |b|:Hidden Flag
+        )
+        |BB|:High Directory ID
+        |BBBBBBBB|:File Data Offset
+        |BBBBBBBB|:File Data Length
+    ]
+};File Headers
+
+{
+    [
+        |B|:File Data Byte
+    ]
+};File Data

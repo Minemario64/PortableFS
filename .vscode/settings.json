@@ -8,6 +8,7 @@
         "newfs",
         "ogfile",
         "pfsntmplte",
-        "svpath"
+        "svpath",
+        "zstd"
     ]
 }
