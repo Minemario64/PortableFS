@@ -1,4 +1,4 @@
-ver: list[str | int] = [2, 0, 0]
+ver: list[str | int] = [2, 1, 0]
 
 def Version(sep: str = "-") -> str:
     if len(ver) < 4:
@@ -10,7 +10,7 @@ def VerData(sep: str = " - ") -> str:
     return "\n".join([f"Python Interface Version: {Version(sep)}", f"Spec Versions: {", ".join([str(version) for version in PortableFS._VERSIONS])}"])
 
 from pathlib import Path
-from typing import BinaryIO, Any, Literal, overload
+from typing import BinaryIO, Any, Literal
 from copy import deepcopy
 from rich.traceback import install ; install()
 from dataclasses import dataclass
@@ -164,7 +164,7 @@ class PortableFS:
             self.__dataLen: int = len(self.file.getbuffer()) - self.__dataStart # type: ignore
 
         fileData: bytes = self.file.read(self.__dataLen)
-        if self.compression:
+        if self.compression and len(fileData) > 0:
             decompressor: zstd.ZstdDecompressor = zstd.ZstdDecompressor()
             fileData: bytes = decompressor.decompress(self.file.read(self.__dataLen))
 
@@ -349,7 +349,7 @@ class PortableFS:
                 fself.__pos: int = 0
                 fself.__mode: str = mode
                 fself.__path: str = pathStr
-                fself.__data: bytes = self._struct.traversalGet(pathStr)[1] if not "w" in mode else bytes()
+                fself.__data: bytes = self._struct.traversalGet(pathStr)[1]
                 fself.__enc: Literal[None, 'ascii', 'utf-8', 'utf-16'] = encoding
                 fself.__closed: bool = False
                 if not isinstance(fself.__data, bytes):
@@ -752,15 +752,15 @@ class PortableFS:
         if len(self.name) > 13:
             raise PortableFSEncodingError("Cannot save a pfs for spec v1 with a name of greater that 13 chars.")
 
-        data: bytes = b"pfs0"
+        data: bytearray = bytearray(b"pfs0")
         compressing: bool = compression if isinstance(compression, bool) else True if isinstance(compression, int) else self.compression
         compressionLevel: int = 0 if not compressing else compression if isinstance(compression, int) else 10 if isinstance(compression, bool) else self.compressionLevel
-        data += bytes([self.version if not compressing else 1]) + bytes([(int(compressing) << 7) | compressionLevel]) + fixedBytesLength(self.name.encode(), 13) + bytes([len(self.drives)])
+        data.extend(bytes([self.version if not compressing else 1]) + bytes([(int(compressing) << 7) | compressionLevel]) + fixedBytesLength(self.name.encode(), 13) + bytes([len(self.drives)]))
         files: list[File] = []
         dirs: list[Directory] = []
         data_list: list[bytes] = []
         for drive in self.drives:
-            data += bytes([(PortableFS._DRIVE_CHARS.index(drive.name) << 4) + drive.id])
+            data.extend(bytes([(PortableFS._DRIVE_CHARS.index(drive.name) << 4) + drive.id]))
             print(f"Saving Files From drive '{drive.name}'")
             dfiles, ddirs, ddata = flattenStructRec(self._struct[drive.name], recursing=False)
             files.extend(dfiles)
@@ -771,7 +771,7 @@ class PortableFS:
         for i, file in enumerate(files):
             file.offset = indexOffset(data_list, i)
 
-        fileData = b"".join(data_list)
+        fileData = bytearray().join(data_list)
 
         if len(dirs).bit_length() > 15:
             PortableFSEncodingError("Cannot save a pfs for spec v1 with the total amount of directories larger than 2^15")
@@ -779,27 +779,27 @@ class PortableFS:
         if len(files).bit_length() > 24:
             PortableFSEncodingError("Cannot save a pfs for spec v1 with the total amount of files larger than 2^24")
 
-        data += len(dirs).to_bytes(2, byteorder="big")
+        data.extend(len(dirs).to_bytes(2, byteorder="big"))
         for directory in dirs:
             if directory.id.bit_length() > 15:
                 PortableFSEncodingError("Cannot save a pfs for spec v1 with a directory ID larger than 2^15")
 
             print(f"Saving dir '{directory.name}'")
-            data += directory.id.to_bytes(2, byteorder="big")
-            data += len(directory.name).to_bytes(byteorder="big")
-            data += bytes(directory.name, 'utf-8')
-            data += bytes([(int(directory.attributes.hidden) << 7)])
-            data += directory.highDir.to_bytes(2, byteorder="big")
+            data.extend(directory.id.to_bytes(2, byteorder="big"))
+            data.extend(len(directory.name).to_bytes(byteorder="big"))
+            data.extend(bytes(directory.name, 'utf-8'))
+            data.extend(bytes([(int(directory.attributes.hidden) << 7)]))
+            data.extend(directory.highDir.to_bytes(2, byteorder="big"))
 
-        data += len(files).to_bytes(3, byteorder="big")
+        data.extend(len(files).to_bytes(3, byteorder="big"))
         for file in files:
             print(f"Saving filedata of file {file.name}")
-            data += len(file.name).to_bytes(byteorder="big")
-            data += bytes(file.name, "utf-8")
-            data += bytes([(int(file.attributes.readOnly) << 7) | (int(file.attributes.hidden) << 6)])
-            data += file.highDir.to_bytes(2, byteorder="big")
-            data += file.offset.to_bytes(8, byteorder="big")
-            data += file.size.to_bytes(8, byteorder="big")
+            data.extend(len(file.name).to_bytes(byteorder="big"))
+            data.extend(bytes(file.name, "utf-8"))
+            data.extend(bytes([(int(file.attributes.readOnly) << 7) | (int(file.attributes.hidden) << 6)]))
+            data.extend(file.highDir.to_bytes(2, byteorder="big"))
+            data.extend(file.offset.to_bytes(8, byteorder="big"))
+            data.extend(file.size.to_bytes(8, byteorder="big"))
 
         print(f"Compiling data")
 
@@ -809,7 +809,7 @@ class PortableFS:
 
         if not len(fileData) > PortableFS.chunkSize:
             print(f"Saving data")
-            data += fileData
+            data.extend(fileData)
 
         else:
             print(f"Saving data as chunks")
@@ -817,7 +817,7 @@ class PortableFS:
             cachedLen: int = len(dataChunks)
             print(f"Saving {cachedLen} chunks")
             for chunk in tqdm(dataChunks, desc="Compiling chunks"):
-                data += chunk
+                data.extend(chunk)
 
         print(f"Compiled Data")
         if retIO:
@@ -871,7 +871,7 @@ class PortableFS:
                 driveData += bytes([(PortableFS._DRIVE_CHARS.index(drive) << 4) | i])
 
             with tmpPath.open("wb") as file:
-                file.write(bytes("pfs0", "utf-8") + bytes([1,0]) + fixedBytesLength(bytes(name, "utf-8"), 13) + driveData + bytes([0, 0, 0, 0, 0]))
+                file.write(bytes("pfs0", "utf-8") + bytes([1,137]) + fixedBytesLength(bytes(name, "utf-8"), 13) + driveData + bytes([0, 0, 0, 0, 0]))
 
             pfs: PortableFS = PortableFS(tmpPath)
             pfs.newfs = True

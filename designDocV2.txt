@@ -25,10 +25,8 @@
         ]
         \B\(
             |b|:Hidden Flag
-            |b|:SimLink Flag
         )
         |BB|:High Directory ID
-        |BB|:SimLink Directory ID *Can skip if SimLink Flag not set*
     ]
 };Directories
 
@@ -42,6 +40,7 @@
         \B\(
             |b|:Read Only Flag
             |b|:Hidden Flag
+            |b|: System Flag (for files that you don't want to be deleted)
         )
         |BB|:High Directory ID
         |BBBBBBBB|:File Data Offset

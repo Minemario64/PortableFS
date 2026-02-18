@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: pfs
+Version: 2.1.0
+Summary: A Python implementation of the PortableFS Specification
+Requires-Python: >=3.13
+Description-Content-Type: text/markdown
+Requires-Dist: tester
+Requires-Dist: tqdm>=4.67.3
+Requires-Dist: zstandard>=0.25.0
+
+# PortableFS
+A Python Library for the .pfs file extension.
+
+**Note: pself or fself in the code is so that I can interact with the FS class instance while in the path function.**
+The tester lib is my testing suite. You can find it in my profile.

@@ -1,4 +1,4 @@
-from __init__ import PortableFS
+from .__init__ import PortableFS
 from pathlib import Path
 
 def copyFileToPFS(pfs: PortableFS, realpath: Path, pfspath) -> None:

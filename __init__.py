@@ -1,4 +1,4 @@
-ver: list[str | int] = [2, 0, 0]
+ver: list[str | int] = [2, 2, 0]
 
 def Version(sep: str = "-") -> str:
     if len(ver) < 4:
@@ -10,7 +10,7 @@ def VerData(sep: str = " - ") -> str:
     return "\n".join([f"Python Interface Version: {Version(sep)}", f"Spec Versions: {", ".join([str(version) for version in PortableFS._VERSIONS])}"])
 
 from pathlib import Path
-from typing import BinaryIO, Any, Literal, overload
+from typing import BinaryIO, Any, Literal
 from copy import deepcopy
 from rich.traceback import install ; install()
 from dataclasses import dataclass
@@ -51,6 +51,7 @@ class Drive:
 class FileAttrs:
     readOnly: bool
     hidden: bool
+    system: bool
 
 @dataclass
 class DirAttrs:
@@ -137,9 +138,10 @@ class PortableFS:
 
             if dir_id >= 0x8000:
                 raise PortableFSEncodingError("Directory ID must be less than 0x8000")
+
             dirname = self.file.read(int(self.file.read(1).hex(), 16)).decode("utf-8")
-            attributesInt = readBits(self.file, 2, 0)
-            attrs = (attributesInt >> 1, attributesInt & 1)
+            attributesInt = readBits(self.file, 1, 0)
+            attrs = (attributesInt & 1,)
             hightDir = int.from_bytes(self.file.read(2), byteorder="big")
             self.dirs.append(Directory(dir_id, dirname, DirAttrs(bool(attrs[0])), hightDir))
 
@@ -148,8 +150,8 @@ class PortableFS:
         self.files: list[File] = []
         for _ in range(self.numFiles):
             filename = self.file.read(int(self.file.read(1).hex(), 16)).decode("utf-8")
-            attributesInt = readBits(self.file, 2, 0)
-            attributes = (attributesInt >> 1, attributesInt & 1)
+            attributesInt = readBits(self.file, 3, 0)
+            attributes = (attributesInt >> 2, attributesInt >> 1, attributesInt & 1)
             highDir = int.from_bytes(self.file.read(2), byteorder="big")
             offset = int.from_bytes(self.file.read(8), byteorder="big")
             size = int.from_bytes(self.file.read(8), byteorder="big")
@@ -164,7 +166,7 @@ class PortableFS:
             self.__dataLen: int = len(self.file.getbuffer()) - self.__dataStart # type: ignore
 
         fileData: bytes = self.file.read(self.__dataLen)
-        if self.compression:
+        if self.compression and len(fileData) > 0:
             decompressor: zstd.ZstdDecompressor = zstd.ZstdDecompressor()
             fileData: bytes = decompressor.decompress(self.file.read(self.__dataLen))
 
@@ -178,7 +180,7 @@ class PortableFS:
                 strCode += f"['{parts[-1]}'] = val"
                 exec(strCode, {"__builtins__": None, "self": self, "val": value})
 
-            def traversalGet(self, path: str, *, mode: int = 0) -> dict | tuple[File, bytes] | tuple[Directory, bytes]:
+            def traversalGet(self, path: str, *, mode: int = 0) -> dict | tuple[File, bytes] | tuple[Directory, dict]:
                 parts: list[str] = [part for part in path.split("/") if part != ""]
                 strCode: str = f"self[{int(parts[0]) if mode == 1 else repr(parts[0])}]"
                 for part in parts[1:-1]:
@@ -349,7 +351,8 @@ class PortableFS:
                 fself.__pos: int = 0
                 fself.__mode: str = mode
                 fself.__path: str = pathStr
-                fself.__data: bytes = self._struct.traversalGet(pathStr)[1] if not "w" in mode else bytes()
+                fself.__data: bytes = self._struct.traversalGet(pathStr)[1] # pyright: ignore[reportAttributeAccessIssue]
+                fself.__obj: File = self._struct.traversalGet(pathStr)[0] # pyright: ignore[reportAttributeAccessIssue]
                 fself.__enc: Literal[None, 'ascii', 'utf-8', 'utf-16'] = encoding
                 fself.__closed: bool = False
                 if not isinstance(fself.__data, bytes):
@@ -368,6 +371,12 @@ class PortableFS:
 
             def flush(fself) -> None: # pyright: ignore[reportSelfClsParameterName]
                 fself.__check_closed()
+                if not fself.__obj.attributes.readOnly:
+                    raise PortableFSFileIOError("Cannot write to a read-only file")
+
+                if fself.__obj.attributes.system:
+                    raise PortableFSFileIOError("Cannot write to a system file")
+
                 self._struct.traversalSet(fself.__path, (self._struct.traversalGet(fself.__path)[0], fself.__data))
 
             def readable(self) -> bool:
@@ -382,6 +391,12 @@ class PortableFS:
                 self.__check_closed()
                 if not self.writable():
                     raise PortableFSFileIOError("Cannot write to a file when not in write mode")
+
+                if not self.__obj.attributes.readOnly:
+                    raise PortableFSFileIOError("Cannot write to a read-only file")
+
+                if self.__obj.attributes.system:
+                    raise PortableFSFileIOError("Cannot write to a system file")
 
                 binMode: bool = 'b' in self.__mode
 
@@ -464,14 +479,29 @@ class PortableFS:
                 self.close()
 
         class FSPath:
-            def __init__(pself, *strPath) -> None: # pyright: ignore[reportSelfClsParameterName]
+            _cwd = f"{self.drives[0].name}:/" if len(self.drives) > 0 else None
+
+            def __init__(pself, *strPath: str) -> None: # pyright: ignore[reportSelfClsParameterName]
                 self._check_closed()
-                pself.path: str = "/".join(strPath)
+                pself.path: str = ((FSPath._cwd or "") if strPath[0].split("/")[0].removesuffix(":") in [drive.name for drive in self.drives] else "") + "/".join(strPath)
                 pself.name: str = [part for part in pself.path.split("/") if part != ""][-1]
                 pself.drive: str = pself.path.split("/")[0].removesuffix(":")
                 pself.suffix: str = "." + pself.name.split(".")[-1] if "." in pself.name else ""
                 pself.stem: str = pself.name[: -len(pself.suffix)] if pself.suffix else pself.name
                 pself.suffixes: list[str] = [f".{ext}" for ext in pself.name.split(".")[1:]] if "." in pself.name else []
+
+            @property
+            def cwd(self) -> "FSPath":
+                if FSPath._cwd is None:
+                    raise PortableFSPathError("No current working directory, as there are no drives in this filesystem")
+
+                return FSPath()
+
+            def chdir(pself) -> None: # pyright: ignore[reportSelfClsParameterName]
+                if not pself.is_dir():
+                    raise PortableFSPathError("Current working directory can only be set to a directory")
+
+                FSPath._cwd = pself.resolve().path
 
             def __Obj(pself) -> File | Directory | Drive: # pyright: ignore[reportSelfClsParameterName]
                 if pself.is_drive():
@@ -546,10 +576,78 @@ class PortableFS:
                 except KeyError:
                     return False
 
+            @property
+            def readonly(pself) -> bool: # pyright: ignore[reportSelfClsParameterName]
+                obj: File | Directory | Drive = pself.__Obj()
+                if isinstance(obj, Drive):
+                    raise PortableFSPathError("Drive paths do not have a read-only attribute")
+
+                elif isinstance(obj, Directory):
+                    raise PortableFSPathError("Directory paths do not have a read-only attribute")
+
+                elif isinstance(obj, File):
+                    return obj.attributes.readOnly
+
+            @readonly.setter
+            def readonly(pself, value: bool) -> None: # pyright: ignore
+                obj: File | Directory | Drive = pself.__Obj()
+                if isinstance(obj, Drive):
+                    raise PortableFSPathError("Drive paths do not have a read-only attribute")
+
+                elif isinstance(obj, Directory):
+                    raise PortableFSPathError("Directory paths do not have a read-only attribute")
+
+                elif isinstance(obj, File):
+                    obj.attributes.readOnly = value
+
+            @property
+            def hidden(pself) -> bool: # pyright: ignore[reportSelfClsParameterName]
+                obj: File | Directory | Drive = pself.__Obj()
+                if isinstance(obj, Drive):
+                    raise PortableFSPathError("Drive paths do not have a hidden attribute")
+
+                elif isinstance(obj, Directory):
+                    return obj.attributes.hidden
+
+                elif isinstance(obj, File):
+                    return obj.attributes.hidden
+
+            @hidden.setter
+            def hidden(pself, value: bool) -> None: # pyright: ignore
+                obj: File | Directory | Drive = pself.__Obj()
+                if isinstance(obj, Drive):
+                    raise PortableFSPathError("Drive paths do not have a hidden attribute")
+
+                elif isinstance(obj, Directory):
+                    obj.attributes.hidden = value
+
+                elif isinstance(obj, File):
+                    obj.attributes.hidden = value
+
+            @property
+            def system(pself) -> bool: # pyright: ignore[reportSelfClsParameterName]
+                obj: File | Directory | Drive = pself.__Obj()
+                if isinstance(obj, Drive):
+                    raise PortableFSPathError("Drive paths do not have a system attribute")
+
+                elif isinstance(obj, Directory):
+                    raise PortableFSPathError("Directory paths do not have a system attribute")
+
+                elif isinstance(obj, File):
+                    return obj.attributes.system
+
+
+            def is_absolute(pself) -> bool: # pyright: ignore[reportSelfClsParameterName]
+                for part in pself.path.split("/"):
+                    if part == "..":
+                        return False
+
+                else:
+                    return True
+
             def is_drive(pself) -> bool: # pyright: ignore[reportSelfClsParameterName]
                 drivePattern = rgx.compile(r"^[ABCDEFGHIJKLMNOP]:/?$")
                 return bool(drivePattern.match(pself.path))
-
 
             def is_file(pself) -> bool: # pyright: ignore[reportSelfClsParameterName]
                 checkStr: str = "struct"
@@ -632,6 +730,27 @@ class PortableFS:
             def joinpath(pself, *strPath): # pyright: ignore[reportSelfClsParameterName]
                 return FSPath(pself.path.removesuffix("/"), *strPath)
 
+            def resolve(pself): # pyright: ignore[reportSelfClsParameterName]
+                if not pself.is_drive():
+                    raise PortableFSPathError("Cannot resolve a path that is not a drive root.")
+
+                resParts: list[str] = []
+                for part in pself.path.split("/"):
+                    match part:
+                        case "" | ".":
+                            continue
+
+                        case "..":
+                            if len(resParts) <= 1:
+                                raise PortableFSPathError("Cannot resolve a path that goes above the root")
+
+                            resParts.pop()
+
+                        case _:
+                            resParts.append(part)
+
+                return FSPath("/".join(resParts))
+
             def touch(pself) -> None: # pyright: ignore[reportSelfClsParameterName]
                 if not pself.parent.exists():
                     raise PortableFSPathError("Cannot touch a file if its parent does not exist.")
@@ -639,7 +758,7 @@ class PortableFS:
                 path = "/".join([pself.drive] + [part for i, part in enumerate(pself.path.split("/")) if i != 0])
 
                 # For some reason, python mangles 'self.__dataLen' wrong
-                self._struct.traversalSet(path, (File(pself.name, FileAttrs(False, False), pself.parent.__Obj().id, self._PortableFS__dataLen, 0), b"")) # pyright: ignore[reportAttributeAccessIssue]
+                self._struct.traversalSet(path, (File(pself.name, FileAttrs(False, False, False), pself.parent.__Obj().id, self._PortableFS__dataLen, 0), b"")) # pyright: ignore[reportAttributeAccessIssue]
 
             def mkdir(pself) -> None: # pyright: ignore[reportSelfClsParameterName]
                 if not pself.parent.exists():
@@ -655,6 +774,9 @@ class PortableFS:
 
                 if not pself.exists():
                     raise PortableFSPathError("Cannot unlink a file or directory that does not exist")
+
+                if pself.is_file() and pself.system:
+                    raise PortableFSPathError("Cannot unlink a system file")
 
                 d: bytes | dict = pself.parent.__StructData()[1]
                 if isinstance(d, dict):
@@ -677,6 +799,35 @@ class PortableFS:
 
         self.Path = FSPath
 
+    def addDrive(self, name: str) -> None:
+        if len(name) != 1 or not name in self._DRIVE_CHARS:
+            raise ValueError("Drive name must be a single character from A to P")
+
+        if name in [drive.name for drive in self.drives]:
+            raise ValueError(f"Drive '{name}' already exists")
+
+        newID: int = 0
+        for drive in self.drives:
+            if drive.id > newID:
+                newID = drive.id
+
+        newID += 1
+        if newID >= 16:
+            raise ValueError("Cannot have more than 16 drives in a PortableFS")
+
+        self.drives.append(Drive(name, newID))
+        self._struct[name] = {}
+
+    def removeDrive(self, name: str) -> None:
+        if name not in [drive.name for drive in self.drives]:
+            raise ValueError(f"Drive '{name}' does not exist")
+
+        for i, drive in enumerate(self.drives):
+            if drive.name == name:
+                self.drives.pop(i)
+                self._struct.pop(name)
+                return
+
     def __repr__(self) -> str:
         return f"PortableFS< name: '{self.name} path: '{self.fspath} >"
 
@@ -697,7 +848,7 @@ class PortableFS:
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.close()
 
-    def save(self, path: Path | None = None, retIO: bool = False, compression: bool | int | None = None) -> None | BytesIO:
+    def save(self, path: Path | None = None, retIO: bool = False, compression: bool | int | None = None, log: bool = True, logChunkCompilation: bool = True) -> None | BytesIO:
         if (path is None and self.fspath is None) and (not retIO):
             raise ValueError("Cannot save a PortableFS with no path specified when it was initialized from a BytesIO")
 
@@ -728,7 +879,7 @@ class PortableFS:
             files, dirs, data = [], [], []
             for name, val in dirContents.items():
                 if isinstance(val[0], File):
-                    print(f"Saving file '{name}'")
+                    if log: print(f"\r\x1b[90mSaving file '{name}'\x1b[0m", end="", flush=True)
                     file: File = val[0]
                     file.name = name
                     file.size = len(val[1])
@@ -752,16 +903,16 @@ class PortableFS:
         if len(self.name) > 13:
             raise PortableFSEncodingError("Cannot save a pfs for spec v1 with a name of greater that 13 chars.")
 
-        data: bytes = b"pfs0"
+        data: bytearray = bytearray(b"pfs0")
         compressing: bool = compression if isinstance(compression, bool) else True if isinstance(compression, int) else self.compression
         compressionLevel: int = 0 if not compressing else compression if isinstance(compression, int) else 10 if isinstance(compression, bool) else self.compressionLevel
-        data += bytes([self.version if not compressing else 1]) + bytes([(int(compressing) << 7) | compressionLevel]) + fixedBytesLength(self.name.encode(), 13) + bytes([len(self.drives)])
+        data.extend(bytes([self.version if not compressing else 1]) + bytes([(int(compressing) << 7) | compressionLevel]) + fixedBytesLength(self.name.encode(), 13) + bytes([len(self.drives)]))
         files: list[File] = []
         dirs: list[Directory] = []
         data_list: list[bytes] = []
         for drive in self.drives:
-            data += bytes([(PortableFS._DRIVE_CHARS.index(drive.name) << 4) + drive.id])
-            print(f"Saving Files From drive '{drive.name}'")
+            data.extend(bytes([(PortableFS._DRIVE_CHARS.index(drive.name) << 4) + drive.id]))
+            if log: print(f"\r\x1b[90mSaving Files From drive '{drive.name}'\x1b[0m", end="", flush=True)
             dfiles, ddirs, ddata = flattenStructRec(self._struct[drive.name], recursing=False)
             files.extend(dfiles)
             dirs.extend(ddirs)
@@ -771,7 +922,7 @@ class PortableFS:
         for i, file in enumerate(files):
             file.offset = indexOffset(data_list, i)
 
-        fileData = b"".join(data_list)
+        fileData = bytearray().join(data_list)
 
         if len(dirs).bit_length() > 15:
             PortableFSEncodingError("Cannot save a pfs for spec v1 with the total amount of directories larger than 2^15")
@@ -779,47 +930,52 @@ class PortableFS:
         if len(files).bit_length() > 24:
             PortableFSEncodingError("Cannot save a pfs for spec v1 with the total amount of files larger than 2^24")
 
-        data += len(dirs).to_bytes(2, byteorder="big")
+        data.extend(len(dirs).to_bytes(2, byteorder="big"))
         for directory in dirs:
             if directory.id.bit_length() > 15:
                 PortableFSEncodingError("Cannot save a pfs for spec v1 with a directory ID larger than 2^15")
 
-            print(f"Saving dir '{directory.name}'")
-            data += directory.id.to_bytes(2, byteorder="big")
-            data += len(directory.name).to_bytes(byteorder="big")
-            data += bytes(directory.name, 'utf-8')
-            data += bytes([(int(directory.attributes.hidden) << 7)])
-            data += directory.highDir.to_bytes(2, byteorder="big")
+            if log: print(f"\r\x1b[90mSaving dir '{directory.name}'\x1b[0m", end="", flush=True)
+            data.extend(directory.id.to_bytes(2, byteorder="big"))
+            data.extend(len(directory.name).to_bytes(byteorder="big"))
+            data.extend(bytes(directory.name, 'utf-8'))
+            data.extend(bytes([(int(directory.attributes.hidden) << 7)]))
+            data.extend(directory.highDir.to_bytes(2, byteorder="big"))
 
-        data += len(files).to_bytes(3, byteorder="big")
+        data.extend(len(files).to_bytes(3, byteorder="big"))
         for file in files:
-            print(f"Saving filedata of file {file.name}")
-            data += len(file.name).to_bytes(byteorder="big")
-            data += bytes(file.name, "utf-8")
-            data += bytes([(int(file.attributes.readOnly) << 7) | (int(file.attributes.hidden) << 6)])
-            data += file.highDir.to_bytes(2, byteorder="big")
-            data += file.offset.to_bytes(8, byteorder="big")
-            data += file.size.to_bytes(8, byteorder="big")
+            if log: print(f"\r\x1b[90mSaving filedata of file {file.name}\x1b[0m", end="", flush=True)
+            data.extend(len(file.name).to_bytes(byteorder="big"))
+            data.extend(bytes(file.name, "utf-8"))
+            data.extend(bytes([(int(file.attributes.readOnly) << 7) | (int(file.attributes.hidden) << 6) | (int(file.attributes.system) << 5)]))
+            data.extend(file.highDir.to_bytes(2, byteorder="big"))
+            data.extend(file.offset.to_bytes(8, byteorder="big"))
+            data.extend(file.size.to_bytes(8, byteorder="big"))
 
-        print(f"Compiling data")
+        if log: print(f"\r\x1b[90mCompiling data\x1b[0m", end="", flush=True)
 
         if compressing:
             compressor = zstd.ZstdCompressor(level=compressionLevel)
             fileData = compressor.compress(fileData)
 
         if not len(fileData) > PortableFS.chunkSize:
-            print(f"Saving data")
-            data += fileData
+            if log: print(f"\r\x1b[90mSaving data\x1b[0m", end="", flush=True)
+            data.extend(fileData)
 
         else:
-            print(f"Saving data as chunks")
+            if log: print(f"\r\x1b[90mSaving data as chunks\x1b[0m", end="", flush=True)
             dataChunks: list[bytes] = [fileData[0 + (i * PortableFS.chunkSize):PortableFS.chunkSize + (i * PortableFS.chunkSize)] for i in range(ceil(len(fileData) / PortableFS.chunkSize))]
             cachedLen: int = len(dataChunks)
-            print(f"Saving {cachedLen} chunks")
-            for chunk in tqdm(dataChunks, desc="Compiling chunks"):
-                data += chunk
+            if log: print(f"\r\x1b[90mSaving {cachedLen} chunks\x1b[0m", end="", flush=True)
+            if logChunkCompilation:
+                for chunk in tqdm(dataChunks, desc="Compiling chunks"):
+                    data.extend(chunk)
 
-        print(f"Compiled Data")
+            else:
+                for chunk in dataChunks:
+                    data.extend(chunk)
+
+        if log: print(f"\r\x1b[90mCompiled Data\x1b[0m")
         if retIO:
             return BytesIO(data)
 
@@ -871,8 +1027,27 @@ class PortableFS:
                 driveData += bytes([(PortableFS._DRIVE_CHARS.index(drive) << 4) | i])
 
             with tmpPath.open("wb") as file:
-                file.write(bytes("pfs0", "utf-8") + bytes([1,0]) + fixedBytesLength(bytes(name, "utf-8"), 13) + driveData + bytes([0, 0, 0, 0, 0]))
+                file.write(bytes("pfs0", "utf-8") + bytes([1,137]) + fixedBytesLength(bytes(name, "utf-8"), 13) + driveData + bytes([0, 0, 0, 0, 0]))
 
             pfs: PortableFS = PortableFS(tmpPath)
             pfs.newfs = True
+            tmpPath.unlink()
+            return pfs
+
+        elif os.name == "posix":
+            tmpPath: Path = Path.cwd().joinpath(".new.pfs")
+
+            if not tmpPath.exists():
+                tmpPath.touch()
+
+            driveData: bytes = bytes([len(drives)])
+            for i, drive in enumerate(drives):
+                driveData += bytes([(PortableFS._DRIVE_CHARS.index(drive) << 4) | i])
+
+            with tmpPath.open("wb") as file:
+                file.write(bytes("pfs0", "utf-8") + bytes([1,137]) + fixedBytesLength(bytes(name, "utf-8"), 13) + driveData + bytes([0, 0, 0, 0, 0]))
+
+            pfs: PortableFS = PortableFS(tmpPath)
+            pfs.newfs = True
+            tmpPath.unlink()
             return pfs
